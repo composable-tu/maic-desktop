@@ -8,7 +8,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 serde_json = "1"
-tauri = { version = "2", features = [] }
+# macos-private-api: enables the HTML Fullscreen API (requestFullscreen) in
+# WKWebView via the private fullScreenEnabled preference. The web app uses
+# it for presentation mode. No-op on Windows/Linux.
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
 
 [features]

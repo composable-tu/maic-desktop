@@ -10,14 +10,25 @@
     "frontendDist": "../src-tauri/frontend-dist"
   },
   "app": {
-    "windows": []
+    "windows": [],
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
-    "resources": ["resources/server.tar.gz"],
-    "externalBin": ["binaries/openmaic-node"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/server.tar.gz"
+    ],
+    "externalBin": [
+      "binaries/openmaic-node"
+    ],
     "category": "Education",
     "shortDescription": "MAIC Desktop",
     "longDescription": "Tauri desktop wrapper for OpenMAIC. The web app runs as a bundled local server; no system Node.js required."
