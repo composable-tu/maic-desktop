@@ -128,22 +128,261 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
             .map_err(|e| format!("failed to create app data dir: {e}"))?;
         // Remove any previous tree so stale files can't shadow the new build.
         let _ = std::fs::remove_dir_all(&server_dir);
-        let status = Command::new("tar")
-            .arg("-xzf")
-            .arg(&tarball)
-            .arg("-C")
-            .arg(&data_dir)
-            .status()
-            .map_err(|e| format!("failed to run tar for server extraction (is tar installed?): {e}"))?;
-        if !status.success() {
-            return Err(format!("server extraction failed (tar exit: {status})"));
-        }
+        extract_tarball(&tarball, &data_dir)?;
+        #[cfg(windows)]
+        restore_links(&server_dir)?;
         std::fs::write(&marker, &staged_meta)
             .map_err(|e| format!("failed to write build marker: {e}"))?;
     } else {
         println!("maic-desktop: reusing extracted server runtime");
     }
     Ok(server_dir)
+}
+
+/// Unpack server.tar.gz into `dest`. Captures stderr so failures report the
+/// tar backend's own message instead of a bare exit code.
+fn extract_tarball(tarball: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    let out = Command::new("tar")
+        .arg("-xzf")
+        .arg(tarball)
+        .arg("-C")
+        .arg(dest)
+        .output()
+        .map_err(|e| format!("failed to run tar for server extraction: {e}"))?;
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!(
+            "server extraction failed (tar exit: {}{})",
+            out.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Restore symlinks from the server/.links.json manifest.
+///
+/// Background: the Windows tar backend (bsdtar) silently drops symlink
+/// entries, so the extracted tree is missing the pnpm isolated-deps links
+/// Node needs (e.g. node_modules/next -> .pnpm/…). Plain symlinks require
+/// privileges on Windows, but directory junctions (`mklink /J`) do not —
+/// and Node resolves junctions the same way. All manifest links point
+/// inside the server tree; file links are materialized as plain copies.
+#[cfg(windows)]
+fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
+    let manifest_path = server_dir.join(".links.json");
+    let text = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        format!(
+            "link manifest missing at {}: {e}",
+            manifest_path.display()
+        )
+    })?;
+    let links = parse_links_manifest(&text)?;
+    let mut restored = 0u32;
+    let mut copied = 0u32;
+    for (link_rel, target_rel) in links {
+        let link = join_rel(server_dir, &link_rel)?;
+        let target = join_rel(server_dir, &target_rel)?;
+        // tar may have materialized the entry as a real file/dir already.
+        if link.exists() || std::fs::symlink_metadata(&link).is_ok() {
+            continue;
+        }
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        match link_plan(&link, &target)? {
+            LinkAction::Junction => {
+                // Junctions need no privileges; use an absolute target so the
+                // link survives regardless of the process working directory.
+                let status = Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&link)
+                    .arg(&target)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .status()
+                    .map_err(|e| format!("failed to run mklink for {}: {e}", link.display()))?;
+                if !status.success() {
+                    return Err(format!(
+                        "failed to create junction {} -> {} (mklink exit: {status})",
+                        link.display(),
+                        target.display()
+                    ));
+                }
+                restored += 1;
+            }
+            LinkAction::CopyFile => {
+                std::fs::copy(&target, &link).map_err(|e| {
+                    format!(
+                        "failed to materialize {} from {}: {e}",
+                        link.display(),
+                        target.display()
+                    )
+                })?;
+                copied += 1;
+            }
+        }
+    }
+    println!("maic-desktop: restored {restored} junctions, materialized {copied} files");
+    Ok(())
+}
+
+/// How a manifest link should be restored on disk.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum LinkAction {
+    /// Target is a directory: create a junction.
+    Junction,
+    /// Target is a file: copy its bytes.
+    CopyFile,
+}
+
+/// Classify a (link, target) pair. Pure logic, unit-tested on all platforms.
+#[cfg(any(windows, test))]
+fn link_plan(link: &std::path::Path, target: &std::path::Path) -> Result<LinkAction, String> {
+    // tar may have materialized the entry as a real file/dir already.
+    if link.exists() || std::fs::symlink_metadata(link).is_ok() {
+        return Err(format!("link already exists: {}", link.display()));
+    }
+    if target.is_dir() {
+        Ok(LinkAction::Junction)
+    } else if target.is_file() {
+        Ok(LinkAction::CopyFile)
+    } else {
+        Err(format!(
+            "link target missing: {} -> {}",
+            link.display(),
+            target.display()
+        ))
+    }
+}
+
+/// Parse the .links.json manifest into (link, target) pairs.
+/// Minimal hand parser: entries are exactly {"link": "…", "target": "…"}.
+/// (No serde_json Value parsing: keeps the manifest path dependency-free.)
+#[cfg(any(windows, test))]
+fn parse_links_manifest(text: &str) -> Result<Vec<(String, String)>, String> {
+    fn unescape(s: &str) -> Result<String, String> {
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match it.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('u') => {
+                    let hex: String = it.by_ref().take(4).collect();
+                    let cp = u32::from_str_radix(&hex, 16)
+                        .map_err(|_| format!("bad \\u escape in {s:?}"))?;
+                    out.push(char::from_u32(cp).ok_or_else(|| format!("bad codepoint in {s:?}"))?);
+                }
+                other => return Err(format!("bad escape in {s:?}: {other:?}")),
+            }
+        }
+        Ok(out)
+    }
+
+    fn field(obj: &str, key: &str) -> Result<String, String> {
+        let needle = format!("\"{key}\"");
+        let k = obj
+            .find(&needle)
+            .ok_or_else(|| format!("entry missing {key}: {obj:?}"))?;
+        let rest = obj[k + needle.len()..].trim_start();
+        let rest = rest
+            .strip_prefix(':')
+            .ok_or_else(|| format!("entry missing colon after {key}: {obj:?}"))?
+            .trim_start();
+        let body = rest
+            .strip_prefix('"')
+            .ok_or_else(|| format!("entry {key} is not a string: {obj:?}"))?;
+        let mut end = None;
+        let mut prev_backslash = false;
+        for (i, c) in body.char_indices() {
+            if c == '"' && !prev_backslash {
+                end = Some(i);
+                break;
+            }
+            prev_backslash = c == '\\' && !prev_backslash;
+        }
+        let end = end.ok_or_else(|| format!("unterminated {key}: {obj:?}"))?;
+        unescape(&body[..end])
+    }
+
+    let text = text.trim();
+    if !text.starts_with('[') || !text.ends_with(']') {
+        return Err("link manifest is not a JSON array".to_string());
+    }
+    // Split top-level {...} objects (manifest entries are flat).
+    let mut entries = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut prev_backslash = false;
+    let mut start = None;
+    for (i, c) in text.char_indices() {
+        if in_str {
+            if c == '"' && !prev_backslash {
+                in_str = false;
+            }
+            prev_backslash = c == '\\' && !prev_backslash;
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                prev_backslash = false;
+            }
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(s) = start.take() {
+                        entries.push(&text[s..=i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    entries
+        .into_iter()
+        .map(|e| Ok((field(e, "link")?, field(e, "target")?)))
+        .collect()
+}
+
+/// Join a manifest-relative POSIX path onto a base dir, rejecting escapes.
+#[cfg(any(windows, test))]
+fn join_rel(base: &std::path::Path, rel: &str) -> Result<PathBuf, String> {
+    if rel.is_empty() {
+        return Err("empty path in link manifest".to_string());
+    }
+    let mut out = base.to_path_buf();
+    for part in rel.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(format!("unsafe path in link manifest: {rel:?}"));
+        }
+        // Reject Windows-absolute paths and drive prefixes smuggled in.
+        if part.contains(':') || part.contains('\\') {
+            return Err(format!("unsafe path in link manifest: {rel:?}"));
+        }
+        out.push(part);
+    }
+    Ok(out)
 }
 
 /// Read .build-meta.json out of the tarball without extracting it.
@@ -422,3 +661,84 @@ fn main() {
             }
         });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn parse_manifest_round_trip() {
+        let text = r#"[
+  {"link": "node_modules/next", "target": ".pnpm/next@16.3.3/node_modules/next"},
+  {"link": "node_modules/.pnpm/node_modules/has \"quote\"\\x", "target": "a/b"}
+]"#;
+        let pairs = parse_links_manifest(text).expect("parse");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(
+            pairs[0],
+            (
+                "node_modules/next".to_string(),
+                ".pnpm/next@16.3.3/node_modules/next".to_string()
+            )
+        );
+        assert_eq!(pairs[1].0, "node_modules/.pnpm/node_modules/has \"quote\"\\x");
+    }
+
+    #[test]
+    fn parse_manifest_rejects_garbage() {
+        assert!(parse_links_manifest("not json").is_err());
+        assert!(parse_links_manifest("[{}]").is_err());
+        assert!(parse_links_manifest(r#"[{"link": 1, "target": "x"}]"#).is_err());
+        assert!(parse_links_manifest("[]").expect("empty").is_empty());
+    }
+
+    #[test]
+    fn join_rel_blocks_escapes() {
+        let base = std::path::Path::new("/data/server");
+        assert_eq!(
+            join_rel(base, "node_modules/next").unwrap(),
+            base.join("node_modules/next")
+        );
+        for evil in ["", ".", "..", "a/../../etc", "C:/win", "a\\b", "a:b"] {
+            assert!(join_rel(base, evil).is_err(), "should reject {evil:?}");
+        }
+    }
+
+    #[test]
+    fn link_plan_classifies_targets() {
+        let dir = std::env::temp_dir().join(format!("maic-plan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("store/pkg")).unwrap();
+        fs::write(dir.join("store/pkg/index.js"), "x").unwrap();
+
+        // Directory target -> junction.
+        let plan = link_plan(&dir.join("node_modules/next"), &dir.join("store/pkg"));
+        assert!(plan.is_ok(), "plan failed: {plan:?}");
+        assert_eq!(plan.unwrap(), LinkAction::Junction);
+
+        // File target -> copy.
+        let plan = link_plan(&dir.join("node_modules/a.js"), &dir.join("store/pkg/index.js"));
+        assert!(plan.is_ok(), "plan failed: {plan:?}");
+        assert_eq!(plan.unwrap(), LinkAction::CopyFile);
+
+        // Missing target -> error mentioning both paths.
+        let err = link_plan(&dir.join("node_modules/gone"), &dir.join("store/nope")).unwrap_err();
+        assert!(err.contains("gone") && err.contains("nope"), "bad error: {err}");
+
+        // Existing link path -> error (tar already materialized it).
+        fs::write(dir.join("node_modules_taken"), "y").unwrap_or_else(|_| {
+            fs::create_dir_all(dir.join("nm")).unwrap();
+            fs::write(dir.join("nm/taken"), "y").unwrap();
+        });
+        let taken = if dir.join("node_modules_taken").exists() {
+            dir.join("node_modules_taken")
+        } else {
+            dir.join("nm/taken")
+        };
+        assert!(link_plan(&taken, &dir.join("store/pkg")).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+

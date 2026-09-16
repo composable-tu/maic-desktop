@@ -87,6 +87,40 @@ async function copyDir(src, dest) {
 // pointing back at the build machine's source tree would dangle on the user's
 // machine. Rewrite them as tree-relative links into the staged copy:
 //   <standaloneDir>/…  ->  <resourcesDir>/…
+// Collect every symlink under dir as { link, target } pairs, both expressed
+// with POSIX separators relative to dir. Written to server/.links.json so the
+// desktop shell can restore links on platforms where the tarball transport
+// cannot carry them (Windows bsdtar drops them; directory junctions created
+// with `mklink /J` need no privileges, unlike symlinks).
+async function collectLinks(dir) {
+  const out = [];
+  async function walk(cur) {
+    const entries = await fs.readdir(cur, { withFileTypes: true });
+    for (const e of entries) {
+      const p = path.join(cur, e.name);
+      if (e.isSymbolicLink()) {
+        const raw = await fs.readlink(p);
+        const abs = path.resolve(path.dirname(p), raw);
+        let relTarget;
+        if (abs === dir || abs.startsWith(dir + path.sep)) {
+          relTarget = path.relative(dir, abs).split(path.sep).join('/');
+        } else {
+          relTarget = raw.split(path.sep).join('/');
+        }
+        out.push({
+          link: path.relative(dir, p).split(path.sep).join('/'),
+          target: relTarget,
+        });
+      } else if (e.isDirectory()) {
+        await walk(p);
+      }
+    }
+  }
+  await walk(dir);
+  out.sort((a, b) => (a.link < b.link ? -1 : a.link > b.link ? 1 : 0));
+  return out;
+}
+
 async function relinkStagedTree(standaloneDir, resourcesDir) {
   async function walk(dir) {
     const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -258,6 +292,15 @@ async function main() {
   };
   await fs.writeFile(path.join(resourcesDir, '.build-meta.json'), JSON.stringify(meta, null, 2));
   console.log('build meta:', JSON.stringify(meta));
+
+  // Symlink manifest for platforms where tar cannot transport links
+  // (Windows bsdtar drops them). The shell restores them as junctions.
+  const links = await collectLinks(resourcesDir);
+  await fs.writeFile(
+    path.join(resourcesDir, '.links.json'),
+    JSON.stringify(links, null, 2),
+  );
+  console.log(`link manifest: ${links.length} links`);
 
   // Tauri's resource bundler does not preserve symlinks (it materializes them
   // or drops them), which breaks pnpm's isolated-deps layout. Ship the server

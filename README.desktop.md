@@ -57,7 +57,16 @@ Staged payload (all gitignored, generated at build time):
 At runtime, the app extracts the tarball to the OS app-data dir on first launch
 (e.g. `~/Library/Application Support/com.maic.desktop/server` on macOS), guarded by a
 `.build-meta.json` marker so updates re-extract exactly once. Extraction needs the
-system `tar` (preinstalled on macOS, mainstream Linux, and Windows 10+).
+system `tar` (preinstalled on macOS, mainstream Linux, and Windows 10+), and
+extraction failures now surface tar's own stderr instead of a bare exit code.
+
+Windows note: the stock tar backend (bsdtar) silently drops symlink entries, which
+would leave the pnpm isolated-deps links (e.g. `node_modules/next`) missing and the
+server dead with `Cannot find module`. `prepare-server` therefore writes a
+`server/.links.json` manifest; on first launch the shell restores directory links as
+NTFS junctions (`mklink /J`, no privileges required — unlike symlinks, which need
+Developer Mode) and materializes file links as plain copies. macOS/Linux are
+unaffected (their tar preserves symlinks; the manifest is ignored there).
 
 macOS Dock note: the Node sidecar binary is copied out of the `.app` bundle into
 `app-data/bin/` before launch, and is re-signed ad-hoc at stage time. Without this,
