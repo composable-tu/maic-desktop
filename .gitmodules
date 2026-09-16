@@ -1,0 +1,3 @@
+[submodule "openmaic-src"]
+	path = openmaic-src
+	url = https://github.com/THU-MAIC/OpenMAIC.git
