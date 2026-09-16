@@ -15,13 +15,13 @@
 
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tauri::path::BaseDirectory;
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
-use tauri_plugin_shell::ShellExt;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -127,6 +127,66 @@ fn read_bundled_meta(tarball: &std::path::Path) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|e| format!("bad build meta encoding: {e}"))
 }
 
+/// Copy the bundled Node sidecar out of the app bundle into the app data dir.
+///
+/// Why: on macOS, any executable living inside `.app/Contents/MacOS/` is
+/// enrolled by LaunchServices as a Foreground app under our bundle id — and
+/// since the server never opens a window, its Dock tile bounces forever.
+/// A copy living outside the bundle (plus the ad-hoc signature applied at
+/// stage time) registers as BackgroundOnly and stays out of the Dock.
+fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("failed to locate app binary: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "app binary has no parent dir".to_string())?;
+    let bundled: PathBuf = std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to list app dir: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("openmaic-node") && p != &exe)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            "bundled node sidecar not found next to the app binary. Rebuild with: node scripts/prepare-server.mjs".to_string()
+        })?;
+
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+    let bin_dir = data_dir.join("bin");
+    let ext = bundled
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let staged = bin_dir.join(format!("openmaic-node{ext}"));
+    let marker = bin_dir.join(".sidecar-meta.json");
+    let current = std::fs::read_to_string(&marker).unwrap_or_default();
+
+    if current != staged_meta || !staged.exists() {
+        std::fs::create_dir_all(&bin_dir)
+            .map_err(|e| format!("failed to create bin dir: {e}"))?;
+        std::fs::copy(&bundled, &staged).map_err(|e| format!("failed to stage sidecar: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&staged)
+                .map_err(|e| format!("failed to stat staged sidecar: {e}"))?
+                .permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&staged, perm)
+                .map_err(|e| format!("failed to chmod staged sidecar: {e}"))?;
+        }
+        std::fs::write(&marker, staged_meta)
+            .map_err(|e| format!("failed to write sidecar marker: {e}"))?;
+        println!("maic-desktop: staged sidecar outside bundle");
+    }
+    Ok(staged)
+}
+
 fn wait_for_health(port: u16) -> bool {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while Instant::now() < deadline {
@@ -185,8 +245,13 @@ fn parse_url(url: &str) -> Option<(String, u16, String)> {
     Some((host, port, path))
 }
 
-/// Spawn the sidecar and block until /api/health is green. Returns the base URL.
-fn start_server(app: &tauri::AppHandle, server_dir: &std::path::Path) -> Result<String, String> {
+/// Spawn the sidecar and block until /api/health is green.
+/// Returns the base URL plus the child handle (killed on app exit).
+fn start_server(
+    _app: &tauri::AppHandle,
+    server_dir: &std::path::Path,
+    node_bin: &std::path::Path,
+) -> Result<(String, Child), String> {
     let server_js = server_dir.join("server.js");
     if !server_js.exists() {
         return Err(format!(
@@ -198,46 +263,40 @@ fn start_server(app: &tauri::AppHandle, server_dir: &std::path::Path) -> Result<
     let mut last_err = String::new();
     for _ in 0..MAX_PORT_ATTEMPTS {
         let port = pick_free_port()?;
-        let child = app
-            .shell()
-            .sidecar("openmaic-node")
-            .map_err(|e| format!("sidecar misconfigured (binaries/openmaic-node-*): {e}"))?
-            .args([server_js.to_string_lossy().to_string()])
+        let child = Command::new(node_bin)
+            .arg(server_js.to_string_lossy().to_string())
             .env("PORT", port.to_string())
             .env("HOSTNAME", "127.0.0.1")
             .env("NODE_ENV", "production")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn();
 
         match child {
-            Ok((mut rx, child)) => {
-                // Drain sidecar events so a chatty server log can't block the pipe.
-                tauri::async_runtime::spawn(async move {
-                    use tauri_plugin_shell::process::CommandEvent;
-                    while let Some(ev) = rx.recv().await {
-                        match ev {
-                            CommandEvent::Stdout(line) => {
-                                println!("[server] {}", String::from_utf8_lossy(&line))
-                            }
-                            CommandEvent::Stderr(line) => {
-                                eprintln!("[server] {}", String::from_utf8_lossy(&line))
-                            }
-                            CommandEvent::Error(msg) => eprintln!("[server error] {msg}"),
-                            CommandEvent::Terminated(status) => {
-                                eprintln!("[server terminated] {status:?}");
-                                break;
-                            }
-                            _ => {}
+            Ok(mut child) => {
+                // Drain pipes so a chatty server log can't block on a full buffer.
+                if let Some(out) = child.stdout.take() {
+                    std::thread::spawn(move || {
+                        use std::io::BufRead;
+                        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                            println!("[server] {line}");
                         }
-                    }
-                });
+                    });
+                }
+                if let Some(err) = child.stderr.take() {
+                    std::thread::spawn(move || {
+                        use std::io::BufRead;
+                        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                            eprintln!("[server] {line}");
+                        }
+                    });
+                }
 
                 if wait_for_health(port) {
-                    // Keep the child handle alive for the app lifetime; the shell
-                    // plugin terminates sidecars when the app exits.
-                    std::mem::forget(child);
-                    return Ok(format!("http://127.0.0.1:{port}/"));
+                    return Ok((format!("http://127.0.0.1:{port}/"), child));
                 }
                 last_err = format!("server on port {port} did not become healthy in time");
+                let _ = child.kill();
                 // Try another port.
             }
             Err(e) => {
@@ -250,22 +309,35 @@ fn start_server(app: &tauri::AppHandle, server_dir: &std::path::Path) -> Result<
     ))
 }
 
+/// App state holding the server child so it can be killed on exit.
+struct ServerChild(Mutex<Option<Child>>);
+
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            // Bundled build marker (also used to version the staged sidecar copy).
+            let tarball = app
+                .path()
+                .resolve("resources/server.tar.gz", BaseDirectory::Resource)
+                .map(|t| read_bundled_meta(&t).unwrap_or_else(|_| "{}".to_string()))
+                .unwrap_or_else(|_| "{}".to_string());
             let server_dir = match ensure_server(app.handle()) {
                 Ok(dir) => dir,
                 Err(msg) => fatal(app.handle(), &msg),
             };
-            let url = match start_server(app.handle(), &server_dir) {
-                Ok(url) => {
-                    println!("maic-desktop: serving {url}");
-                    url
+            let node_bin = match ensure_sidecar(app.handle(), &tarball) {
+                Ok(bin) => bin,
+                Err(msg) => fatal(app.handle(), &msg),
+            };
+            let (url, child) = match start_server(app.handle(), &server_dir, &node_bin) {
+                Ok(pair) => {
+                    println!("maic-desktop: serving {}", pair.0);
+                    pair
                 }
                 Err(msg) => fatal(app.handle(), &msg),
             };
+            app.manage(ServerChild(Mutex::new(Some(child))));
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse().map_err(
                 |e| format!("invalid server url: {e}"),
             )?))
@@ -274,6 +346,28 @@ fn main() {
             .build()?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run maic-desktop");
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(state) = window.app_handle().try_state::<ServerChild>() {
+                    if let Ok(mut guard) = state.0.lock() {
+                        if let Some(mut child) = guard.take() {
+                            let _ = child.kill();
+                        }
+                    }
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("failed to build maic-desktop")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<ServerChild>() {
+                    if let Ok(mut guard) = state.0.lock() {
+                        if let Some(mut child) = guard.take() {
+                            let _ = child.kill();
+                        }
+                    }
+                }
+            }
+        });
 }

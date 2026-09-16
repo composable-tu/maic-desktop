@@ -56,6 +56,13 @@ At runtime, the app extracts the tarball to the OS app-data dir on first launch
 `.build-meta.json` marker so updates re-extract exactly once. Extraction needs the
 system `tar` (preinstalled on macOS, mainstream Linux, and Windows 10+).
 
+macOS Dock note: the Node sidecar binary is copied out of the `.app` bundle into
+`app-data/bin/` before launch, and is re-signed ad-hoc at stage time. Without this,
+LaunchServices enrolls any executable inside `Contents/MacOS/` as a Foreground app
+under our bundle id — and since the server never opens a window, its Dock tile
+bounces forever. Outside the bundle it registers as BackgroundOnly and stays out
+of the Dock (verified with `lsappinfo list`).
+
 `tauri dev` note: dev builds read `src-tauri/resources/server/` in place. After a fresh
 `prepare-server` run, sync it into the dev profile once with
 `cp -R src-tauri/resources/server src-tauri/target/debug/resources/`.
