@@ -1,0 +1,279 @@
+// main.rs — MAIC Desktop shell.
+//
+// Boot flow (all on the main thread, inside `setup`):
+//  1. Ensure the bundled server tree is extracted to the app data dir
+//     (shipped as server.tar.gz because bundlers don't preserve symlinks;
+//     skipped when the staged .build-meta.json already matches).
+//  2. Pick a free loopback port from the OS.
+//  3. Spawn the bundled Node sidecar running the Next.js standalone server
+//     with PORT/HOSTNAME pointed at it.
+//  4. Poll /api/health until it responds 200 (or time out with a fatal dialog).
+//  5. Open the main window against the local server.
+//
+// Exiting the app terminates the sidecar. No system Node.js is required.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use tauri::path::BaseDirectory;
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_shell::ShellExt;
+
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_PORT_ATTEMPTS: u32 = 5;
+
+/// Ask the OS for a free loopback port. The listener is dropped immediately,
+/// so the race window is small; the caller retries with a fresh port on failure.
+fn pick_free_port() -> Result<u16, String> {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("failed to bind loopback for port selection: {e}"))?
+        .local_addr()
+        .map_err(|e| format!("failed to read selected port: {e}"))?
+        .port();
+    Ok(port)
+}
+
+fn fatal(app: &tauri::AppHandle, message: &str) -> ! {
+    eprintln!("maic-desktop fatal: {message}");
+    // We run on the main thread during setup, so blocking is fine.
+    let _ = app
+        .dialog()
+        .message(message.to_string())
+        .title("MAIC Desktop")
+        .kind(MessageDialogKind::Error)
+        .blocking_show();
+    std::process::exit(1);
+}
+
+/// Locate the extracted server tree, extracting server.tar.gz on first launch
+/// (or when the bundled build differs from what's on disk).
+fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    // Dev builds run straight from the source tree, where prepare-server
+    // leaves an unpacked server/ dir — use it directly if present.
+    let dev_dir = app
+        .path()
+        .resolve("resources/server", BaseDirectory::Resource)
+        .map_err(|e| format!("failed to resolve resources: {e}"))?;
+    let dev_meta = dev_dir.join(".build-meta.json");
+    if dev_meta.exists() {
+        let server_js = dev_dir.join("server.js");
+        if server_js.exists() {
+            println!("maic-desktop: using dev server tree at {}", dev_dir.display());
+            return Ok(dev_dir);
+        }
+    }
+
+    let tarball = app
+        .path()
+        .resolve("resources/server.tar.gz", BaseDirectory::Resource)
+        .map_err(|e| format!("failed to resolve bundled server.tar.gz: {e}"))?;
+    if !tarball.exists() {
+        return Err(format!(
+            "bundled server not found (looked for {} and {}). Rebuild with: node scripts/prepare-server.mjs",
+            dev_dir.join("server.js").display(),
+            tarball.display(),
+        ));
+    }
+
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+    let staged_meta = read_bundled_meta(&tarball).unwrap_or_else(|_| "{}".to_string());
+    let marker = data_dir.join(".build-meta.json");
+    let current = std::fs::read_to_string(&marker).unwrap_or_default();
+    let server_dir = data_dir.join("server");
+
+    if current != staged_meta || !server_dir.join("server.js").exists() {
+        println!("maic-desktop: extracting server runtime (first launch or update)…");
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| format!("failed to create app data dir: {e}"))?;
+        // Remove any previous tree so stale files can't shadow the new build.
+        let _ = std::fs::remove_dir_all(&server_dir);
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&data_dir)
+            .status()
+            .map_err(|e| format!("failed to run tar for server extraction (is tar installed?): {e}"))?;
+        if !status.success() {
+            return Err(format!("server extraction failed (tar exit: {status})"));
+        }
+        std::fs::write(&marker, &staged_meta)
+            .map_err(|e| format!("failed to write build marker: {e}"))?;
+    } else {
+        println!("maic-desktop: reusing extracted server runtime");
+    }
+    Ok(server_dir)
+}
+
+/// Read .build-meta.json out of the tarball without extracting it.
+fn read_bundled_meta(tarball: &std::path::Path) -> Result<String, String> {
+    let out = Command::new("tar")
+        .arg("-xzOf")
+        .arg(tarball)
+        .arg("server/.build-meta.json")
+        .output()
+        .map_err(|e| format!("failed to inspect server.tar.gz: {e}"))?;
+    if !out.status.success() {
+        return Err("server.tar.gz has no build meta".to_string());
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("bad build meta encoding: {e}"))
+}
+
+fn wait_for_health(port: u16) -> bool {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            let url = format!("http://127.0.0.1:{port}/api/health");
+            if let Ok(true) = http_get_ok(&url) {
+                return true;
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    false
+}
+
+/// Minimal blocking HTTP GET returning true on 2xx. No extra crates.
+fn http_get_ok(url: &str) -> Result<bool, ()> {
+    use std::io::{Read, Write};
+
+    let (host, port, path) = parse_url(url).ok_or(())?;
+    let mut stream = std::net::TcpStream::connect(format!("{host}:{port}")).map_err(|_| ())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|_| ())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|_| ())?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|_| ())?;
+    let mut buf = vec![0u8; 4096];
+    let mut raw = Vec::new();
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    let head = String::from_utf8_lossy(&raw);
+    let status_line = head.lines().next().unwrap_or("");
+    Ok(status_line.contains(" 200 ") || status_line.contains(" 200"))
+}
+
+fn parse_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = match authority.rfind(':') {
+        Some(i) => (authority[..i].to_string(), authority[i + 1..].parse().ok()?),
+        None => (authority.to_string(), 80),
+    };
+    Some((host, port, path))
+}
+
+/// Spawn the sidecar and block until /api/health is green. Returns the base URL.
+fn start_server(app: &tauri::AppHandle, server_dir: &std::path::Path) -> Result<String, String> {
+    let server_js = server_dir.join("server.js");
+    if !server_js.exists() {
+        return Err(format!(
+            "server.js missing at {}. Rebuild with: node scripts/prepare-server.mjs",
+            server_js.display()
+        ));
+    }
+
+    let mut last_err = String::new();
+    for _ in 0..MAX_PORT_ATTEMPTS {
+        let port = pick_free_port()?;
+        let child = app
+            .shell()
+            .sidecar("openmaic-node")
+            .map_err(|e| format!("sidecar misconfigured (binaries/openmaic-node-*): {e}"))?
+            .args([server_js.to_string_lossy().to_string()])
+            .env("PORT", port.to_string())
+            .env("HOSTNAME", "127.0.0.1")
+            .env("NODE_ENV", "production")
+            .spawn();
+
+        match child {
+            Ok((mut rx, child)) => {
+                // Drain sidecar events so a chatty server log can't block the pipe.
+                tauri::async_runtime::spawn(async move {
+                    use tauri_plugin_shell::process::CommandEvent;
+                    while let Some(ev) = rx.recv().await {
+                        match ev {
+                            CommandEvent::Stdout(line) => {
+                                println!("[server] {}", String::from_utf8_lossy(&line))
+                            }
+                            CommandEvent::Stderr(line) => {
+                                eprintln!("[server] {}", String::from_utf8_lossy(&line))
+                            }
+                            CommandEvent::Error(msg) => eprintln!("[server error] {msg}"),
+                            CommandEvent::Terminated(status) => {
+                                eprintln!("[server terminated] {status:?}");
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+
+                if wait_for_health(port) {
+                    // Keep the child handle alive for the app lifetime; the shell
+                    // plugin terminates sidecars when the app exits.
+                    std::mem::forget(child);
+                    return Ok(format!("http://127.0.0.1:{port}/"));
+                }
+                last_err = format!("server on port {port} did not become healthy in time");
+                // Try another port.
+            }
+            Err(e) => {
+                last_err = format!("failed to spawn bundled node (port busy?): {e}");
+            }
+        }
+    }
+    Err(format!(
+        "could not start the bundled MAIC server after {MAX_PORT_ATTEMPTS} attempts. {last_err}"
+    ))
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let server_dir = match ensure_server(app.handle()) {
+                Ok(dir) => dir,
+                Err(msg) => fatal(app.handle(), &msg),
+            };
+            let url = match start_server(app.handle(), &server_dir) {
+                Ok(url) => {
+                    println!("maic-desktop: serving {url}");
+                    url
+                }
+                Err(msg) => fatal(app.handle(), &msg),
+            };
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse().map_err(
+                |e| format!("invalid server url: {e}"),
+            )?))
+            .title("MAIC Desktop")
+            .inner_size(1280.0, 800.0)
+            .build()?;
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("failed to run maic-desktop");
+}

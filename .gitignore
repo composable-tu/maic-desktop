@@ -37,3 +37,11 @@ next-env.d.ts
 
 .idea
 .zcode
+
+# tauri desktop wrapper (generated at build time, never commit)
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/resources/server/
+src-tauri/resources/server.tar.gz
+src-tauri/gen/
+dist/

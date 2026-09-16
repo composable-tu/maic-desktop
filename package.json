@@ -1,0 +1,16 @@
+{
+  "name": "maic-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tauri desktop wrapper for OpenMAIC (source lives in the openmaic-src submodule, never modified here).",
+  "packageManager": "pnpm@10.28.0",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "prepare:server": "node scripts/prepare-server.mjs",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
