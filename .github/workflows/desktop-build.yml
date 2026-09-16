@@ -10,7 +10,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Matrix-aware group: a shared group with cancel-in-progress makes
+  # parallel platform jobs cancel each other. New pushes supersede
+  # only the same-target run.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.job }}-${{ matrix.target }}
   cancel-in-progress: true
 
 jobs:
