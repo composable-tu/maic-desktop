@@ -59,7 +59,10 @@ function parseArgs(argv) {
 
 function run(cmd, args, opts = {}) {
   console.log(`$ ${cmd} ${args.join(' ')}`);
-  execFileSync(cmd, args, { stdio: 'inherit', ...opts });
+  // On Windows, tools installed via package managers (pnpm, corepack shims)
+  // are .CMD wrappers that can only be resolved through the shell.
+  const shell = process.platform === 'win32';
+  execFileSync(cmd, args, { stdio: 'inherit', shell, ...opts });
 }
 
 async function pathExists(p) {

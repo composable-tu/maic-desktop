@@ -12,10 +12,13 @@ be statically exported. Instead the desktop app ships the Next.js **standalone s
 
 - **Dev** (`pnpm dev`): Tauri window points at the submodule's `next dev` on `localhost:3000`.
 - **Production**: on launch, the Rust shell ensures the server runtime is extracted
-  (see below), picks a **dynamic loopback port** (`127.0.0.1:0`), spawns
-  `openmaic-node server.js` with `PORT`/`HOSTNAME` set, waits for `/api/health`
-  (~60 s timeout on first launch while the runtime extracts, ~20 s after), then opens
-  the main window against it. No system Node.js required.
+  (see below), picks a **sticky loopback port** (recorded in `server-port.json` in the
+  app-data dir and reused while free — this keeps the origin stable so IndexedDB,
+  localStorage and the Cache API persist across launches; a second instance gets a
+  fresh port), spawns the Node sidecar from outside the bundle (see Dock note) with
+  `PORT`/`HOSTNAME` set, waits for `/api/health` (~60 s timeout on first launch while
+  the runtime extracts, ~20 s after), then opens the main window against it.
+  No system Node.js required.
 - Multiple instances each get their own port; exiting the app terminates its sidecar.
 
 ## Prerequisites

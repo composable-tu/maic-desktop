@@ -38,6 +38,39 @@ fn pick_free_port() -> Result<u16, String> {
     Ok(port)
 }
 
+/// Check whether a loopback port is currently free.
+fn port_is_free(port: u16) -> bool {
+    TcpListener::bind(format!("127.0.0.1:{port}")).is_ok()
+}
+
+/// Sticky port selection. Web storage (IndexedDB, localStorage, Cache API) is
+/// scoped to the origin, so a random port every launch would orphan all cached
+/// data. Reuse the port recorded in the app data dir when it is still free;
+/// otherwise allocate a fresh one and record it.
+fn pick_sticky_port(app: &tauri::AppHandle) -> Result<u16, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+    let marker = data_dir.join("server-port.json");
+
+    if let Ok(text) = std::fs::read_to_string(&marker) {
+        if let Ok(port) = text.trim().parse::<u16>() {
+            if port != 0 && port_is_free(port) {
+                println!("maic-desktop: reusing sticky port {port}");
+                return Ok(port);
+            }
+        }
+    }
+
+    let port = pick_free_port()?;
+    // Best effort: a stale marker is harmless (next launch retries).
+    let _ = std::fs::create_dir_all(&data_dir)
+        .and_then(|_| std::fs::write(&marker, port.to_string()));
+    println!("maic-desktop: allocated fresh port {port}");
+    Ok(port)
+}
+
 fn fatal(app: &tauri::AppHandle, message: &str) -> ! {
     eprintln!("maic-desktop fatal: {message}");
     // We run on the main thread during setup, so blocking is fine.
@@ -248,7 +281,7 @@ fn parse_url(url: &str) -> Option<(String, u16, String)> {
 /// Spawn the sidecar and block until /api/health is green.
 /// Returns the base URL plus the child handle (killed on app exit).
 fn start_server(
-    _app: &tauri::AppHandle,
+    app: &tauri::AppHandle,
     server_dir: &std::path::Path,
     node_bin: &std::path::Path,
 ) -> Result<(String, Child), String> {
@@ -260,9 +293,22 @@ fn start_server(
         ));
     }
 
+    // First attempt uses the sticky port (keeps the origin — and therefore
+    // IndexedDB/localStorage — stable across launches). Fall back to fresh
+    // ports if it is busy (e.g. a second instance).
+    let mut first: Option<u16> = match pick_sticky_port(app) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("maic-desktop: sticky port unavailable ({e}), allocating fresh");
+            None
+        }
+    };
     let mut last_err = String::new();
     for _ in 0..MAX_PORT_ATTEMPTS {
-        let port = pick_free_port()?;
+        let port = match first.take() {
+            Some(p) => p,
+            None => pick_free_port()?,
+        };
         let child = Command::new(node_bin)
             .arg(server_js.to_string_lossy().to_string())
             .env("PORT", port.to_string())
@@ -293,6 +339,11 @@ fn start_server(
                 }
 
                 if wait_for_health(port) {
+                    // Record the port that actually serves, so the next launch
+                    // reuses it and the origin (IndexedDB/localStorage) stays put.
+                    if let Ok(data_dir) = app.path().app_data_dir() {
+                        let _ = std::fs::write(data_dir.join("server-port.json"), port.to_string());
+                    }
                     return Ok((format!("http://127.0.0.1:{port}/"), child));
                 }
                 last_err = format!("server on port {port} did not become healthy in time");
