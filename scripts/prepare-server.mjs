@@ -277,6 +277,7 @@ async function smokeTestBundledTarball(tarballPath, nodeBin, label) {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'maic-server-smoke-'));
   const serverDir = path.join(tmp, 'server');
   let child = null;
+  let exited = null;
   let tail = '';
   const keep = (chunk) => {
     tail = (tail + String(chunk)).slice(-8000);
@@ -299,12 +300,17 @@ async function smokeTestBundledTarball(tarballPath, nodeBin, label) {
     });
     child.stdout.on('data', keep);
     child.stderr.on('data', keep);
+    exited = new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) resolve();
+      else child.once('exit', resolve);
+    });
 
     const deadline = Date.now() + 120_000;
     for (;;) {
-      if (child.exitCode !== null) {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        const how = child.exitCode !== null ? `code ${child.exitCode}` : `signal ${child.signalCode}`;
         throw new Error(
-          `smoke boot failed: server exited with code ${child.exitCode} before serving ${url}\n` +
+          `smoke boot failed: server exited with ${how} before serving ${url}\n` +
             `--- server output ---\n${tail}`,
         );
       }
@@ -322,9 +328,41 @@ async function smokeTestBundledTarball(tarballPath, nodeBin, label) {
       await sleep(250);
     }
   } finally {
-    if (child && child.exitCode === null) child.kill();
-    await fs.rm(tmp, { recursive: true, force: true });
+    if (child && child.exitCode === null && child.signalCode === null) child.kill();
+    // The child's cwd lives inside the temp tree, so nothing under it can be
+    // removed until the process is actually reaped.
+    if (exited) await Promise.race([exited, sleep(10_000)]);
+    // Then Windows can still hold the directory a while longer (a killed
+    // node.exe releases its cwd handle late, and Defender scans a freshly
+    // unpacked 189 MB tree). The verdict is already recorded by this point, so
+    // a stubborn temp dir is reported and skipped rather than failing a build
+    // whose bundle just booted healthy.
+    if (!(await removeTreeWithRetries(tmp))) {
+      console.warn(`smoke boot: could not clean up ${tmp} (still locked); leaving it to the OS temp cleaner`);
+    }
   }
+}
+
+// Retry an unlink of a tree a killed process may still hold. Never throws: the
+// caller decides whether a leftover temp dir matters, and a cleanup error must
+// not mask the smoke test's own failure.
+async function removeTreeWithRetries(dir, { attempts = 30, delayMs = 1000 } = {}) {
+  // EBUSY/EPERM/EACCES are what a locked cwd and an AV scan surface as on
+  // Windows; ENOTEMPTY is the partial-delete retry that follows them.
+  const retryable = new Set(['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY']);
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+      return true;
+    } catch (err) {
+      if (!retryable.has(err?.code)) {
+        console.warn(`cleanup of ${dir} failed: ${err?.message || err}`);
+        return false;
+      }
+      await sleep(delayMs);
+    }
+  }
+  return false;
 }
 
 function freePort() {
