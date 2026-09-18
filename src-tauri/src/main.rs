@@ -152,14 +152,28 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(server_dir)
 }
 
+/// Suppress the console window for helper child processes on Windows.
+///
+/// The shell is a GUI-subsystem app (`windows_subsystem = "windows"`), but
+/// every console-subsystem child it spawns (`tar.exe`, `cmd.exe`,
+/// `openmaic-node.exe`) gets a fresh visible console by default — piping
+/// stdio does not prevent that. `CREATE_NO_WINDOW` runs them silently while
+/// keeping exit codes and captured output intact. No-op on other platforms.
+#[cfg(windows)]
+fn hide_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
 /// Unpack server.tar.gz into `dest`. Captures stderr so failures report the
 /// tar backend's own message instead of a bare exit code.
 fn extract_tarball(tarball: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
-    let out = Command::new("tar")
-        .arg("-xzf")
-        .arg(tarball)
-        .arg("-C")
-        .arg(dest)
+    let mut cmd = Command::new("tar");
+    cmd.arg("-xzf").arg(tarball).arg("-C").arg(dest);
+    #[cfg(windows)]
+    hide_console(&mut cmd);
+    let out = cmd
         .output()
         .map_err(|e| format!("failed to run tar for server extraction: {e}"))?;
     if !out.status.success() {
@@ -231,12 +245,14 @@ fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
 /// process working directory.
 #[cfg(windows)]
 fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
-    let status = Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", "mklink", "/J"])
         .arg(link)
         .arg(target)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    hide_console(&mut cmd);
+    let status = cmd
         .status()
         .map_err(|e| format!("failed to run mklink for {}: {e}", link.display()))?;
     if !status.success() {
@@ -413,10 +429,11 @@ fn join_rel(base: &std::path::Path, rel: &str) -> Result<PathBuf, String> {
 
 /// Read .build-meta.json out of the tarball without extracting it.
 fn read_bundled_meta(tarball: &std::path::Path) -> Result<String, String> {
-    let out = Command::new("tar")
-        .arg("-xzOf")
-        .arg(tarball)
-        .arg("server/.build-meta.json")
+    let mut cmd = Command::new("tar");
+    cmd.arg("-xzOf").arg(tarball).arg("server/.build-meta.json");
+    #[cfg(windows)]
+    hide_console(&mut cmd);
+    let out = cmd
         .output()
         .map_err(|e| format!("failed to inspect server.tar.gz: {e}"))?;
     if !out.status.success() {
@@ -592,14 +609,16 @@ fn start_server(
             Some(p) => p,
             None => pick_free_port()?,
         };
-        let child = Command::new(node_bin)
-            .arg(server_js.to_string_lossy().to_string())
+        let mut cmd = Command::new(node_bin);
+        cmd.arg(server_js.to_string_lossy().to_string())
             .env("PORT", port.to_string())
             .env("HOSTNAME", "127.0.0.1")
             .env("NODE_ENV", "production")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        hide_console(&mut cmd);
+        let child = cmd.spawn();
 
         match child {
             Ok(mut child) => {
