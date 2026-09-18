@@ -121,6 +121,58 @@ async function collectLinks(dir) {
   return out;
 }
 
+// Copy a file/dir tree, resolving through symlinks (like `cp -rL`).
+async function copyResolved(src, dest) {
+  const st = await fs.stat(src);
+  if (st.isDirectory()) {
+    await fs.mkdir(dest, { recursive: true });
+    for (const e of await fs.readdir(src)) {
+      await copyResolved(path.join(src, e), path.join(dest, e));
+    }
+  } else {
+    await fs.copyFile(src, dest);
+  }
+}
+
+// Replace every symlink pointing OUTSIDE the staged tree with a real copy
+// of its target (or delete it when the target is gone). Next.js standalone
+// tracing on Windows leaves links into the workspace root node_modules
+// (e.g. D:/a/…/openmaic-src/node_modules/…) that cannot be shipped: the
+// manifest only allows tree-relative targets and the Rust side refuses
+// absolute/escaping paths. Must run BEFORE collectLinks/stripLinks.
+async function materializeExternalLinks(stagedDir) {
+  let count = 0;
+  async function walk(cur) {
+    const entries = await fs.readdir(cur, { withFileTypes: true });
+    for (const e of entries) {
+      const p = path.join(cur, e.name);
+      if (e.isSymbolicLink()) {
+        const raw = await fs.readlink(p);
+        const abs = path.resolve(path.dirname(p), raw);
+        if (abs === stagedDir || abs.startsWith(stagedDir + path.sep)) {
+          continue; // inside the tree: relink/strip handles it later
+        }
+        let alive = false;
+        try {
+          await fs.stat(abs);
+          alive = true;
+        } catch {
+          // dangling: drop it, nothing requires it at runtime
+        }
+        await fs.rm(p);
+        if (alive) {
+          await copyResolved(abs, p);
+          count++;
+        }
+      } else if (e.isDirectory()) {
+        await walk(p);
+      }
+    }
+  }
+  await walk(stagedDir);
+  console.log(`materialized ${count} external links into the staged tree`);
+}
+
 // Delete every symlink under dir (files stay). Used before packing the
 // tarball: Windows bsdtar cannot extract symlink entries (it mangles them
 // into \\?\C:\… paths and aborts with "Invalid argument"). The removed
@@ -324,9 +376,14 @@ async function main() {
   await fs.writeFile(path.join(resourcesDir, '.build-meta.json'), JSON.stringify(meta, null, 2));
   console.log('build meta:', JSON.stringify(meta));
 
-  // Symlink manifest for restoring links after extraction (the tarball
-  // transport cannot carry them on Windows — see stripLinks below). The shell
-  // restores them as junctions/symlinks.
+  // Fold workspace-external links (Windows tracing leaves absolute links
+  // into the source node_modules) into real files BEFORE the manifest is
+  // collected — the manifest only allows tree-relative targets.
+  await materializeExternalLinks(resourcesDir);
+
+  // Symlink manifest for restoring links after extraction. The shell
+  // recreates every entry at first launch (junctions on Windows, symlinks
+  // elsewhere) because the tarball below ships zero symlinks.
   const links = await collectLinks(resourcesDir);
   await fs.writeFile(
     path.join(resourcesDir, '.links.json'),
