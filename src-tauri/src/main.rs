@@ -739,7 +739,7 @@ fn boot_in_background(app: &tauri::AppHandle) {
         .resolve("resources/server.tar.gz", BaseDirectory::Resource)
         .map(|t| read_bundled_meta(&t).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_else(|_| "{}".to_string());
-    splash_status(app, "Preparing local server…");
+    splash_status(app, STATUS_PREPARING);
     let server_dir = match ensure_server(app) {
         Ok(dir) => dir,
         Err(msg) => return boot_failed(app, &msg),
@@ -748,7 +748,7 @@ fn boot_in_background(app: &tauri::AppHandle) {
         Ok(bin) => bin,
         Err(msg) => return boot_failed(app, &msg),
     };
-    splash_status(app, "Starting local server…");
+    splash_status(app, STATUS_STARTING);
     let (url, child) = match start_server(app, &server_dir, &node_bin) {
         Ok(pair) => {
             println!("maic-desktop: serving {}", pair.0);
@@ -782,12 +782,18 @@ fn boot_in_background(app: &tauri::AppHandle) {
     }
 }
 
+/// Status keys the splash translates. The wording lives in `STRINGS` inside
+/// splash.html so it can follow the webview's locale; `splash_status` carries
+/// only the key.
+const STATUS_PREPARING: &str = "preparing";
+const STATUS_STARTING: &str = "starting";
+
 /// Push a status line to the splash window (best effort). Evals can be dropped
 /// while the page is still loading, so the build-target footer rides along with
 /// every push: whichever one first reaches the document paints the whole page.
-fn splash_status(app: &tauri::AppHandle, text: &str) {
+fn splash_status(app: &tauri::AppHandle, key: &str) {
     if let Some(splash) = app.get_webview_window("splash") {
-        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
         let _ = splash.eval(format!(
             "window.__maicStatus && window.__maicStatus(\"{escaped}\");\
              window.__maicTarget && window.__maicTarget({:?})",
@@ -966,20 +972,33 @@ mod tests {
     }
 
     #[test]
-    fn target_label_reads_like_a_download_page() {
+    fn splash_defines_every_status_key_the_shell_sends() {
+        // The wording lives in splash.html and the shell only carries keys, so a
+        // rename on one side alone would silently print a raw key in the window.
+        const SPLASH: &str = include_str!("../frontend-dist/splash.html");
+        for key in [STATUS_PREPARING, STATUS_STARTING, "failed"] {
+            assert!(
+                SPLASH.contains(&format!("{key}:")),
+                "splash.html has no STRINGS entry for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_label_names_the_build_target() {
         assert_eq!(target_label("macos", "aarch64"), "macOS (Apple Silicon)");
-        assert_eq!(target_label("macos", "x86_64"), "macOS (Intel)");
-        assert_eq!(target_label("windows", "x86_64"), "Windows (x64)");
-        assert_eq!(target_label("windows", "aarch64"), "Windows (ARM64)");
-        assert_eq!(target_label("linux", "x86_64"), "Linux (x64)");
-        // An arch nobody has named yet stays literal rather than being guessed.
+        assert_eq!(target_label("macos", "x86_64"), "macOS (Intel Chip)");
+        assert_eq!(target_label("windows", "x86_64"), "Windows (x86_64)");
+        assert_eq!(target_label("windows", "aarch64"), "Windows (Arm64)");
+        assert_eq!(target_label("linux", "x86_64"), "Linux (x86_64)");
+        // An arch nobody has named yet is reported as the raw constant.
         assert_eq!(target_label("linux", "arm"), "Linux (arm)");
-        // Tripwire: a new build target must be given human wording here, not
-        // leak a raw triple fragment into the splash.
         let live = build_target_label();
         assert!(
-            live.contains('(') && !live.contains("x86_64") && !live.contains("aarch64"),
-            "unmapped target label: {live}"
+            live.starts_with("macOS (")
+                || live.starts_with("Windows (")
+                || live.starts_with("Linux ("),
+            "unrecognised target family: {live}"
         );
     }
 
