@@ -459,18 +459,35 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
     Ok(staged)
 }
 
-fn wait_for_health(port: u16) -> bool {
+/// Outcome of waiting for the server to become healthy.
+#[derive(Debug, PartialEq, Eq)]
+enum HealthOutcome {
+    /// /api/health answered 200.
+    Healthy,
+    /// Something accepted TCP connections but /api/health never went green.
+    ListeningButUnhealthy,
+    /// Nothing ever accepted TCP connections — the server likely exited.
+    NoListener,
+}
+
+fn wait_for_health(port: u16) -> HealthOutcome {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut ever_listened = false;
     while Instant::now() < deadline {
         if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            ever_listened = true;
             let url = format!("http://127.0.0.1:{port}/api/health");
             if let Ok(true) = http_get_ok(&url) {
-                return true;
+                return HealthOutcome::Healthy;
             }
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    false
+    if ever_listened {
+        HealthOutcome::ListeningButUnhealthy
+    } else {
+        HealthOutcome::NoListener
+    }
 }
 
 /// Minimal blocking HTTP GET returning true on 2xx. No extra crates.
@@ -559,35 +576,59 @@ fn start_server(
 
         match child {
             Ok(mut child) => {
+                // Keep the tail of server output: on failure it goes into the
+                // fatal dialog, so a bug report carries the real Node error.
+                let log: std::sync::Arc<Mutex<String>> =
+                    std::sync::Arc::new(Mutex::new(String::new()));
                 // Drain pipes so a chatty server log can't block on a full buffer.
                 if let Some(out) = child.stdout.take() {
+                    let log = std::sync::Arc::clone(&log);
                     std::thread::spawn(move || {
                         use std::io::BufRead;
                         for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
                             println!("[server] {line}");
+                            push_log(&log, &line);
                         }
                     });
                 }
                 if let Some(err) = child.stderr.take() {
+                    let log = std::sync::Arc::clone(&log);
                     std::thread::spawn(move || {
                         use std::io::BufRead;
                         for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
                             eprintln!("[server] {line}");
+                            push_log(&log, &line);
                         }
                     });
                 }
 
-                if wait_for_health(port) {
-                    // Record the port that actually serves, so the next launch
-                    // reuses it and the origin (IndexedDB/localStorage) stays put.
-                    if let Ok(data_dir) = app.path().app_data_dir() {
-                        let _ = std::fs::write(data_dir.join("server-port.json"), port.to_string());
+                match wait_for_health(port) {
+                    HealthOutcome::Healthy => {
+                        // Record the port that actually serves, so the next launch
+                        // reuses it and the origin (IndexedDB/localStorage) stays put.
+                        if let Ok(data_dir) = app.path().app_data_dir() {
+                            let _ = std::fs::write(data_dir.join("server-port.json"), port.to_string());
+                        }
+                        return Ok((format!("http://127.0.0.1:{port}/"), child));
                     }
-                    return Ok((format!("http://127.0.0.1:{port}/"), child));
+                    outcome => {
+                        // Give the drain threads a moment to flush the exit error.
+                        std::thread::sleep(Duration::from_millis(500));
+                        let tail = log.lock().map(|g| g.clone()).unwrap_or_default();
+                        let _ = child.kill();
+                        last_err = match outcome {
+                            HealthOutcome::NoListener => format!(
+                                "server on port {port} never accepted connections (it likely crashed on startup){}",
+                                format_log_tail(&tail),
+                            ),
+                            _ => format!(
+                                "server on port {port} never became healthy{}",
+                                format_log_tail(&tail),
+                            ),
+                        };
+                        // Try another port.
+                    }
                 }
-                last_err = format!("server on port {port} did not become healthy in time");
-                let _ = child.kill();
-                // Try another port.
             }
             Err(e) => {
                 last_err = format!("failed to spawn bundled node (port busy?): {e}");
@@ -597,6 +638,30 @@ fn start_server(
     Err(format!(
         "could not start the bundled MAIC server after {MAX_PORT_ATTEMPTS} attempts. {last_err}"
     ))
+}
+
+/// Append a line to the shared tail buffer, keeping roughly the last 4 KB.
+fn push_log(log: &Mutex<String>, line: &str) {
+    if let Ok(mut guard) = log.lock() {
+        guard.push_str(line);
+        guard.push('\n');
+        const KEEP: usize = 4096;
+        if guard.len() > KEEP * 2 {
+            let drop = guard.len() - KEEP;
+            let cut = guard[drop..].find('\n').map(|i| drop + i + 1).unwrap_or(drop);
+            guard.drain(..cut);
+        }
+    }
+}
+
+/// Render the captured tail for the fatal dialog (empty when silent).
+fn format_log_tail(tail: &str) -> String {
+    let tail = tail.trim();
+    if tail.is_empty() {
+        String::new()
+    } else {
+        format!(".\n\nServer output:\n{tail}")
+    }
 }
 
 /// App state holding the server child so it can be killed on exit.
@@ -742,3 +807,29 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod log_tail_tests {
+    use super::*;
+
+    #[test]
+    fn tail_keeps_last_lines() {
+        let log = Mutex::new(String::new());
+        for i in 0..200 {
+            push_log(&log, &format!("line {i:03} padding-padding-padding-padding"));
+        }
+        let guard = log.lock().unwrap();
+        assert!(guard.len() <= 8192 + 64);
+        assert!(guard.contains("line 199"));
+        assert!(!guard.contains("line 000"));
+    }
+
+    #[test]
+    fn tail_formats_for_dialog() {
+        assert_eq!(format_log_tail(""), "");
+        assert_eq!(format_log_tail("   \n  "), "");
+        let out = format_log_tail("Error: boom\n");
+        assert!(out.contains("Server output:"));
+        assert!(out.contains("Error: boom"));
+    }
+}
