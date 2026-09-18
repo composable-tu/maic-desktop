@@ -65,8 +65,8 @@ fn pick_sticky_port(app: &tauri::AppHandle) -> Result<u16, String> {
 
     let port = pick_free_port()?;
     // Best effort: a stale marker is harmless (next launch retries).
-    let _ = std::fs::create_dir_all(&data_dir)
-        .and_then(|_| std::fs::write(&marker, port.to_string()));
+    let _ =
+        std::fs::create_dir_all(&data_dir).and_then(|_| std::fs::write(&marker, port.to_string()));
     println!("maic-desktop: allocated fresh port {port}");
     Ok(port)
 }
@@ -96,7 +96,10 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     if dev_meta.exists() {
         let server_js = dev_dir.join("server.js");
         if server_js.exists() {
-            println!("maic-desktop: using dev server tree at {}", dev_dir.display());
+            println!(
+                "maic-desktop: using dev server tree at {}",
+                dev_dir.display()
+            );
             return Ok(dev_dir);
         }
     }
@@ -127,9 +130,19 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("failed to create app data dir: {e}"))?;
         // Remove any previous tree so stale files can't shadow the new build.
-        let _ = std::fs::remove_dir_all(&server_dir);
+        // Fail loudly here: extracting over a half-removed tree (e.g. locked
+        // junctions on Windows) produces a corrupt server that dies later
+        // with a confusing module error.
+        if server_dir.exists() {
+            std::fs::remove_dir_all(&server_dir).map_err(|e| {
+                format!(
+                    "failed to clear previous server at {} (is another instance running?): {e}",
+                    server_dir.display()
+                )
+            })?;
+        }
         extract_tarball(&tarball, &data_dir)?;
-        #[cfg(windows)]
+        // Recreate the pnpm symlink layout (the tarball carries none).
         restore_links(&server_dir)?;
         std::fs::write(&marker, &staged_meta)
             .map_err(|e| format!("failed to write build marker: {e}"))?;
@@ -166,28 +179,25 @@ fn extract_tarball(tarball: &std::path::Path, dest: &std::path::Path) -> Result<
 
 /// Restore symlinks from the server/.links.json manifest.
 ///
-/// Background: the Windows tar backend (bsdtar) silently drops symlink
-/// entries, so the extracted tree is missing the pnpm isolated-deps links
-/// Node needs (e.g. node_modules/next -> .pnpm/…). Plain symlinks require
-/// privileges on Windows, but directory junctions (`mklink /J`) do not —
-/// and Node resolves junctions the same way. All manifest links point
-/// inside the server tree; file links are materialized as plain copies.
-#[cfg(windows)]
+/// Background: the tarball ships zero symlinks (Windows bsdtar mangles them
+/// into \\?\C:\… paths and aborts extraction with "Invalid argument"), so
+/// every link in the pnpm isolated-deps layout must be recreated at launch.
+/// On Windows, directory links become NTFS junctions (`mklink /J`, no
+/// privileges required — unlike symlinks, which need Developer Mode) and
+/// file links are materialized as copies; on unix both become symlinks.
+/// Node resolves junctions the same way, so all platforms behave alike.
+/// All manifest links point inside the server tree; anything else is refused.
 fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
     let manifest_path = server_dir.join(".links.json");
-    let text = std::fs::read_to_string(&manifest_path).map_err(|e| {
-        format!(
-            "link manifest missing at {}: {e}",
-            manifest_path.display()
-        )
-    })?;
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("link manifest missing at {}: {e}", manifest_path.display()))?;
     let links = parse_links_manifest(&text)?;
     let mut restored = 0u32;
     let mut copied = 0u32;
     for (link_rel, target_rel) in links {
         let link = join_rel(server_dir, &link_rel)?;
         let target = join_rel(server_dir, &target_rel)?;
-        // tar may have materialized the entry as a real file/dir already.
+        // The entry may already exist (older tarball, dev tree) — skip those.
         if link.exists() || std::fs::symlink_metadata(&link).is_ok() {
             continue;
         }
@@ -197,23 +207,7 @@ fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
         }
         match link_plan(&link, &target)? {
             LinkAction::Junction => {
-                // Junctions need no privileges; use an absolute target so the
-                // link survives regardless of the process working directory.
-                let status = Command::new("cmd")
-                    .args(["/C", "mklink", "/J"])
-                    .arg(&link)
-                    .arg(&target)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .status()
-                    .map_err(|e| format!("failed to run mklink for {}: {e}", link.display()))?;
-                if !status.success() {
-                    return Err(format!(
-                        "failed to create junction {} -> {} (mklink exit: {status})",
-                        link.display(),
-                        target.display()
-                    ));
-                }
+                create_dir_link(&link, &target)?;
                 restored += 1;
             }
             LinkAction::CopyFile => {
@@ -228,12 +222,47 @@ fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
             }
         }
     }
-    println!("maic-desktop: restored {restored} junctions, materialized {copied} files");
+    println!("maic-desktop: restored {restored} dir links, materialized {copied} files");
+    Ok(())
+}
+
+/// Create a directory link: junction on Windows, symlink on unix.
+/// Junctions use an absolute target so they survive regardless of the
+/// process working directory.
+#[cfg(windows)]
+fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    let status = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .map_err(|e| format!("failed to run mklink for {}: {e}", link.display()))?;
+    if !status.success() {
+        return Err(format!(
+            "failed to create junction {} -> {} (mklink exit: {status})",
+            link.display(),
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Create a directory link: junction on Windows, symlink on unix.
+#[cfg(not(windows))]
+fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(target, link).map_err(|e| {
+        format!(
+            "failed to symlink {} -> {}: {e}",
+            link.display(),
+            target.display()
+        )
+    })?;
     Ok(())
 }
 
 /// How a manifest link should be restored on disk.
-#[cfg(any(windows, test))]
 #[derive(Debug, PartialEq, Eq)]
 enum LinkAction {
     /// Target is a directory: create a junction.
@@ -243,7 +272,6 @@ enum LinkAction {
 }
 
 /// Classify a (link, target) pair. Pure logic, unit-tested on all platforms.
-#[cfg(any(windows, test))]
 fn link_plan(link: &std::path::Path, target: &std::path::Path) -> Result<LinkAction, String> {
     // tar may have materialized the entry as a real file/dir already.
     if link.exists() || std::fs::symlink_metadata(link).is_ok() {
@@ -265,7 +293,6 @@ fn link_plan(link: &std::path::Path, target: &std::path::Path) -> Result<LinkAct
 /// Parse the .links.json manifest into (link, target) pairs.
 /// Minimal hand parser: entries are exactly {"link": "…", "target": "…"}.
 /// (No serde_json Value parsing: keeps the manifest path dependency-free.)
-#[cfg(any(windows, test))]
 fn parse_links_manifest(text: &str) -> Result<Vec<(String, String)>, String> {
     fn unescape(s: &str) -> Result<String, String> {
         let mut out = String::with_capacity(s.len());
@@ -366,7 +393,6 @@ fn parse_links_manifest(text: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 /// Join a manifest-relative POSIX path onto a base dir, rejecting escapes.
-#[cfg(any(windows, test))]
 fn join_rel(base: &std::path::Path, rel: &str) -> Result<PathBuf, String> {
     if rel.is_empty() {
         return Err("empty path in link manifest".to_string());
@@ -411,18 +437,20 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
     let dir = exe
         .parent()
         .ok_or_else(|| "app binary has no parent dir".to_string())?;
-    let bundled: PathBuf = std::fs::read_dir(dir)
-        .map_err(|e| format!("failed to list app dir: {e}"))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("openmaic-node") && p != &exe)
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| {
-            "bundled node sidecar not found next to the app binary. Rebuild with: node scripts/prepare-server.mjs".to_string()
-        })?;
+    // Exact per-OS filename: the bundler strips the target triple from
+    // externalBin binaries and places `<name>[.exe]` beside the app binary.
+    // A prefix scan risks grabbing a stale/partial file; fail loudly instead.
+    #[cfg(windows)]
+    let expected = "openmaic-node.exe";
+    #[cfg(not(windows))]
+    let expected = "openmaic-node";
+    let bundled = dir.join(expected);
+    if !bundled.is_file() {
+        return Err(format!(
+            "bundled node sidecar not found at {} (expected {expected:?} next to the app binary). Rebuild with: node scripts/prepare-server.mjs",
+            bundled.display(),
+        ));
+    }
 
     let data_dir = app
         .path()
@@ -439,8 +467,7 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
     let current = std::fs::read_to_string(&marker).unwrap_or_default();
 
     if current != staged_meta || !staged.exists() {
-        std::fs::create_dir_all(&bin_dir)
-            .map_err(|e| format!("failed to create bin dir: {e}"))?;
+        std::fs::create_dir_all(&bin_dir).map_err(|e| format!("failed to create bin dir: {e}"))?;
         std::fs::copy(&bundled, &staged).map_err(|e| format!("failed to stage sidecar: {e}"))?;
         #[cfg(unix)]
         {
@@ -607,7 +634,8 @@ fn start_server(
                         // Record the port that actually serves, so the next launch
                         // reuses it and the origin (IndexedDB/localStorage) stays put.
                         if let Ok(data_dir) = app.path().app_data_dir() {
-                            let _ = std::fs::write(data_dir.join("server-port.json"), port.to_string());
+                            let _ =
+                                std::fs::write(data_dir.join("server-port.json"), port.to_string());
                         }
                         return Ok((format!("http://127.0.0.1:{port}/"), child));
                     }
@@ -648,7 +676,10 @@ fn push_log(log: &Mutex<String>, line: &str) {
         const KEEP: usize = 4096;
         if guard.len() > KEEP * 2 {
             let drop = guard.len() - KEEP;
-            let cut = guard[drop..].find('\n').map(|i| drop + i + 1).unwrap_or(drop);
+            let cut = guard[drop..]
+                .find('\n')
+                .map(|i| drop + i + 1)
+                .unwrap_or(drop);
             guard.drain(..cut);
         }
     }
@@ -693,9 +724,14 @@ fn main() {
                 Err(msg) => fatal(app.handle(), &msg),
             };
             app.manage(ServerChild(Mutex::new(Some(child))));
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse().map_err(
-                |e| format!("invalid server url: {e}"),
-            )?))
+            WebviewWindowBuilder::new(
+                app,
+                "main",
+                WebviewUrl::External(
+                    url.parse()
+                        .map_err(|e| format!("invalid server url: {e}"))?,
+                ),
+            )
             .title("MAIC Desktop")
             .inner_size(1280.0, 800.0)
             .build()?;
@@ -747,7 +783,10 @@ mod tests {
                 ".pnpm/next@16.3.3/node_modules/next".to_string()
             )
         );
-        assert_eq!(pairs[1].0, "node_modules/.pnpm/node_modules/has \"quote\"\\x");
+        assert_eq!(
+            pairs[1].0,
+            "node_modules/.pnpm/node_modules/has \"quote\"\\x"
+        );
     }
 
     #[test]
@@ -783,13 +822,19 @@ mod tests {
         assert_eq!(plan.unwrap(), LinkAction::Junction);
 
         // File target -> copy.
-        let plan = link_plan(&dir.join("node_modules/a.js"), &dir.join("store/pkg/index.js"));
+        let plan = link_plan(
+            &dir.join("node_modules/a.js"),
+            &dir.join("store/pkg/index.js"),
+        );
         assert!(plan.is_ok(), "plan failed: {plan:?}");
         assert_eq!(plan.unwrap(), LinkAction::CopyFile);
 
         // Missing target -> error mentioning both paths.
         let err = link_plan(&dir.join("node_modules/gone"), &dir.join("store/nope")).unwrap_err();
-        assert!(err.contains("gone") && err.contains("nope"), "bad error: {err}");
+        assert!(
+            err.contains("gone") && err.contains("nope"),
+            "bad error: {err}"
+        );
 
         // Existing link path -> error (tar already materialized it).
         fs::write(dir.join("node_modules_taken"), "y").unwrap_or_else(|_| {
@@ -807,7 +852,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod log_tail_tests {
     use super::*;
@@ -816,7 +860,10 @@ mod log_tail_tests {
     fn tail_keeps_last_lines() {
         let log = Mutex::new(String::new());
         for i in 0..200 {
-            push_log(&log, &format!("line {i:03} padding-padding-padding-padding"));
+            push_log(
+                &log,
+                &format!("line {i:03} padding-padding-padding-padding"),
+            );
         }
         let guard = log.lock().unwrap();
         assert!(guard.len() <= 8192 + 64);

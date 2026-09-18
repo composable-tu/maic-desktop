@@ -121,6 +121,28 @@ async function collectLinks(dir) {
   return out;
 }
 
+// Delete every symlink under dir (files stay). Used before packing the
+// tarball: Windows bsdtar cannot extract symlink entries (it mangles them
+// into \\?\C:\… paths and aborts with "Invalid argument"). The removed
+// links are fully described by .links.json and restored at launch.
+async function stripLinks(dir) {
+  let count = 0;
+  async function walk(cur) {
+    const entries = await fs.readdir(cur, { withFileTypes: true });
+    for (const e of entries) {
+      const p = path.join(cur, e.name);
+      if (e.isSymbolicLink()) {
+        await fs.rm(p);
+        count++;
+      } else if (e.isDirectory()) {
+        await walk(p);
+      }
+    }
+  }
+  await walk(dir);
+  console.log(`stripped ${count} symlinks before packing`);
+}
+
 async function relinkStagedTree(standaloneDir, resourcesDir) {
   async function walk(dir) {
     const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -233,6 +255,15 @@ async function stageNodeBinary(triple, version) {
     }
   }
   await fs.rm(tmp, { recursive: true, force: true });
+  // Sanity: a 0-byte (or missing) placeholder must never be bundled as the
+  // sidecar — it would install fine and then die silently at launch.
+  const binStat = await fs.stat(outPath);
+  const MIN_NODE_BYTES = 10 * 1024 * 1024;
+  if (binStat.size < MIN_NODE_BYTES) {
+    throw new Error(
+      `staged sidecar too small (${binStat.size} bytes): ${outPath} — refusing to bundle`,
+    );
+  }
   console.log(`staged node binary: ${outPath}`);
   return outName;
 }
@@ -293,8 +324,9 @@ async function main() {
   await fs.writeFile(path.join(resourcesDir, '.build-meta.json'), JSON.stringify(meta, null, 2));
   console.log('build meta:', JSON.stringify(meta));
 
-  // Symlink manifest for platforms where tar cannot transport links
-  // (Windows bsdtar drops them). The shell restores them as junctions.
+  // Symlink manifest for restoring links after extraction (the tarball
+  // transport cannot carry them on Windows — see stripLinks below). The shell
+  // restores them as junctions/symlinks.
   const links = await collectLinks(resourcesDir);
   await fs.writeFile(
     path.join(resourcesDir, '.links.json'),
@@ -302,14 +334,20 @@ async function main() {
   );
   console.log(`link manifest: ${links.length} links`);
 
+  // Remove every symlink from the staged tree BEFORE packing. Windows bsdtar
+  // turns symlink entries into \\?\C:\…-prefixed paths at extract time,
+  // which fails with "Invalid argument" and aborts the whole extraction.
+  // The tree is fully described by .links.json, so nothing is lost.
+  await stripLinks(resourcesDir);
+
   // Tauri's resource bundler does not preserve symlinks (it materializes them
-  // or drops them), which breaks pnpm's isolated-deps layout. Ship the server
-  // tree as a tarball instead — symlinks intact — and let the Rust shell
-  // extract it to the app data dir on first launch. The tarball also shrinks
-  // the installer substantially.
+  // or drops them), which breaks pnpm's isolated-deps layout — and Windows
+  // bsdtar mangles symlink entries into \\?\C:\… paths and aborts extraction.
+  // So the tarball ships zero symlinks (stripped above); the shell restores
+  // them from .links.json at first launch. The tarball also shrinks the
+  // installer substantially.
   const tarballPath = path.join(path.dirname(resourcesDir), 'server.tar.gz');
   await fs.rm(tarballPath, { force: true });
-  // -h would dereference; we want links preserved, so plain -czf.
   run('tar', ['-czf', tarballPath, '-C', path.dirname(resourcesDir), 'server']);
   const tarStat = await fs.stat(tarballPath);
   const dirStat = await fs.stat(resourcesDir);
