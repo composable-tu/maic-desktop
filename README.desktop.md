@@ -12,7 +12,9 @@ be statically exported. Instead the desktop app ships the Next.js **standalone s
 
 - **Dev** (`pnpm dev`): Tauri window points at the submodule's `next dev` on `localhost:3000`.
 - **Production**: on launch, the Rust shell ensures the server runtime is extracted
-  (see below), picks a **sticky loopback port** (recorded in `server-port.json` in the
+  (see below), picks a loopback port — **31846 when free**, otherwise the
+  previously recorded sticky port, otherwise a fresh random one (recorded in
+  `server-port.json` in the
   app-data dir and reused while free — this keeps the origin stable so IndexedDB,
   localStorage and the Cache API persist across launches; a second instance gets a
   fresh port), spawns the Node sidecar from outside the bundle (see Dock note) with

@@ -29,6 +29,12 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_PORT_ATTEMPTS: u32 = 5;
 
+/// Preferred loopback port for the bundled server. Fresh installs (and any
+/// launch without a usable sticky marker) take this when it is free, so the
+/// origin — and therefore IndexedDB/localStorage — is identical across
+/// machines. Falls back to a random free port when busy.
+const PREFERRED_PORT: u16 = 31846;
+
 /// Ask the OS for a free loopback port. The listener is dropped immediately,
 /// so the race window is small; the caller retries with a fresh port on failure.
 fn pick_free_port() -> Result<u16, String> {
@@ -45,10 +51,29 @@ fn port_is_free(port: u16) -> bool {
     TcpListener::bind(format!("127.0.0.1:{port}")).is_ok()
 }
 
+/// Port choice order. Pure logic, unit-tested:
+/// 1. PREFERRED_PORT when free (one stable origin across machines/installs),
+/// 2. the recorded sticky port when still free,
+/// 3. a fresh random port.
+/// Note step 1 migrates old installs to the preferred port on next launch;
+/// web storage tied to the previous origin is orphaned once (same as today
+/// when the sticky port is taken).
+fn select_port(sticky: Option<u16>, preferred_free: bool, sticky_free: bool) -> Option<u16> {
+    if preferred_free {
+        return Some(PREFERRED_PORT);
+    }
+    if let Some(p) = sticky {
+        if p != 0 && sticky_free {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Sticky port selection. Web storage (IndexedDB, localStorage, Cache API) is
 /// scoped to the origin, so a random port every launch would orphan all cached
-/// data. Reuse the port recorded in the app data dir when it is still free;
-/// otherwise allocate a fresh one and record it.
+/// data. Prefer PREFERRED_PORT when free; reuse the port recorded in the app
+/// data dir when it is still free; otherwise allocate a fresh one and record it.
 fn pick_sticky_port(app: &tauri::AppHandle) -> Result<u16, String> {
     let data_dir = app
         .path()
@@ -56,20 +81,32 @@ fn pick_sticky_port(app: &tauri::AppHandle) -> Result<u16, String> {
         .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
     let marker = data_dir.join("server-port.json");
 
+    let mut sticky: Option<u16> = None;
     if let Ok(text) = std::fs::read_to_string(&marker) {
         if let Ok(port) = text.trim().parse::<u16>() {
-            if port != 0 && port_is_free(port) {
-                println!("maic-desktop: reusing sticky port {port}");
-                return Ok(port);
-            }
+            sticky = Some(port);
         }
     }
+    let sticky_free = sticky.is_some_and(|p| p != 0 && port_is_free(p));
 
-    let port = pick_free_port()?;
+    let port = match select_port(sticky, port_is_free(PREFERRED_PORT), sticky_free) {
+        Some(p) => {
+            if Some(p) == sticky {
+                println!("maic-desktop: reusing sticky port {p}");
+            } else {
+                println!("maic-desktop: using preferred port {p}");
+            }
+            p
+        }
+        None => {
+            let fresh = pick_free_port()?;
+            println!("maic-desktop: allocated fresh port {fresh}");
+            fresh
+        }
+    };
     // Best effort: a stale marker is harmless (next launch retries).
     let _ =
         std::fs::create_dir_all(&data_dir).and_then(|_| std::fs::write(&marker, port.to_string()));
-    println!("maic-desktop: allocated fresh port {port}");
     Ok(port)
 }
 
@@ -1143,6 +1180,19 @@ mod tests {
         // splash -> main handoff) must not kill the server.
         assert!(!owns_server("splash"));
         assert!(!owns_server(""));
+    }
+
+    #[test]
+    fn preferred_port_wins_over_sticky() {
+        // Free preferred port always wins (migrates old installs to 31846).
+        assert_eq!(select_port(None, true, false), Some(PREFERRED_PORT));
+        assert_eq!(select_port(Some(1234), true, true), Some(PREFERRED_PORT));
+        // Busy preferred: reuse the sticky port while free, else fresh.
+        assert_eq!(select_port(Some(53588), false, true), Some(53588));
+        assert_eq!(select_port(Some(0), false, false), None);
+        assert_eq!(select_port(Some(53588), false, false), None);
+        assert_eq!(select_port(None, false, false), None);
+        assert_eq!(PREFERRED_PORT, 31846);
     }
 
     #[test]
