@@ -55,6 +55,7 @@ fn port_is_free(port: u16) -> bool {
 /// 1. PREFERRED_PORT when free (one stable origin across machines/installs),
 /// 2. the recorded sticky port when still free,
 /// 3. a fresh random port.
+///
 /// Note step 1 migrates old installs to the preferred port on next launch;
 /// web storage tied to the previous origin is orphaned once (same as today
 /// when the sticky port is taken).
@@ -951,9 +952,11 @@ fn start_server(
         ));
     }
 
-    let mut healed = false;
     let mut last_err = String::new();
-    loop {
+    // At most two full passes: the initial pass, plus one retry pass after a
+    // MODULE_NOT_FOUND heal (re-extraction). Spelled as a bounded loop so
+    // clippy::never_loop stays quiet.
+    for pass in 0..2u32 {
         // First attempt uses the sticky port (keeps the origin — and therefore
         // IndexedDB/localStorage — stable across launches). Fall back to fresh
         // ports if it is busy (e.g. a second instance).
@@ -1041,12 +1044,10 @@ fn start_server(
                             };
                             // Broken staged tree (MODULE_NOT_FOUND in the log):
                             // re-extract once — a fresh extraction restores
-                            // every link from .links.json — then retry from the
-                            // top. `healed` guarantees this happens at most
-                            // once, so a genuinely bad bundle still reports its
-                            // error after the next full pass.
-                            if tail.contains("MODULE_NOT_FOUND") && !healed {
-                                healed = true;
+                            // every link from .links.json — then pass 1
+                            // retries from the top. A genuinely bad bundle
+                            // still reports its error after the second pass.
+                            if tail.contains("MODULE_NOT_FOUND") && pass == 0 {
                                 eprintln!(
                                     "maic-desktop: server crashed with MODULE_NOT_FOUND; re-extracting server tree and retrying"
                                 );
@@ -1061,7 +1062,7 @@ fn start_server(
                                 let staged_meta = read_bundled_meta(&tarball)
                                     .unwrap_or_else(|_| "{}".to_string());
                                 stage_fresh_server(&tarball, &data_dir, server_dir, &staged_meta)?;
-                                continue;
+                                break;
                             }
                             // Try another port.
                         }
@@ -1073,11 +1074,12 @@ fn start_server(
             }
         }
         // All port attempts exhausted without a healthy server (and without a
-        // healable crash): report the last real error.
-        return Err(format!(
-            "could not start the bundled MAIC server after {MAX_PORT_ATTEMPTS} attempts. {last_err}"
-        ));
+        // healable crash on this pass): fall through to the next pass or to
+        // the final error below.
     }
+    Err(format!(
+        "could not start the bundled MAIC server after {MAX_PORT_ATTEMPTS} attempts. {last_err}"
+    ))
 }
 
 /// Append a line to the shared tail buffer, keeping roughly the last 4 KB.
