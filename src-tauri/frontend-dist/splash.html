@@ -68,7 +68,7 @@
       #error {
         display: none;
         flex: 1 1 auto; min-height: 0;
-        width: 100%; margin: 8px clamp(24px, 8vw, 48px) 20px;
+        width: 90%; margin: 8px clamp(24px, 8vw, 48px) 20px;
         text-align: left; font-size: 12px;
         border: 1px solid rgba(242, 19, 97, 0.3); border-radius: 6px;
         padding: 10px 12px; overflow: auto;
@@ -78,7 +78,10 @@
       #error.show { display: block; }
       .footer {
         position: absolute; left: 0; right: 0; bottom: 6px;
-        text-align: center; font-size: 10px; line-height: 1; letter-spacing: 0.08em;
+        /* Same side gutter as the error panel, so both corners line up. */
+        display: flex; justify-content: space-between; gap: 16px;
+        padding: 0 clamp(24px, 8vw, 24px);
+        font-size: 10px; line-height: 1; letter-spacing: 0.08em;
         color: rgba(255, 255, 255, 0.25);
       }
     </style>
@@ -93,10 +96,13 @@
       </div>
     </div>
     <div id="error"></div>
-    <div class="footer">Unofficial OpenMAIC Desktop</div>
+    <div class="footer"><span>Unofficial OpenMAIC Desktop</span><span id="target"></span></div>
     <script>
       window.__maicStatus = function (text) {
         document.getElementById('status').textContent = text;
+      };
+      window.__maicTarget = function (text) {
+        document.getElementById('target').textContent = text;
       };
       window.__maicFatal = function (message) {
         document.body.classList.add('has-error');

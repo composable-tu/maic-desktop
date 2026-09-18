@@ -782,14 +782,44 @@ fn boot_in_background(app: &tauri::AppHandle) {
     }
 }
 
-/// Push a status line to the splash window (best effort).
+/// Push a status line to the splash window (best effort). Evals can be dropped
+/// while the page is still loading, so the build-target footer rides along with
+/// every push: whichever one first reaches the document paints the whole page.
 fn splash_status(app: &tauri::AppHandle, text: &str) {
     if let Some(splash) = app.get_webview_window("splash") {
         let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
         let _ = splash.eval(format!(
-            "window.__maicStatus && window.__maicStatus(\"{escaped}\")"
+            "window.__maicStatus && window.__maicStatus(\"{escaped}\");\
+             window.__maicTarget && window.__maicTarget({:?})",
+            build_target_label()
         ));
     }
+}
+
+/// Name the platform this executable was built for, in the wording the
+/// download page uses. Built from compile-time constants, so it reports the
+/// installer's target rather than the machine's OS — which is the distinction
+/// that matters (an x64 build running under emulation on Windows on ARM keeps
+/// saying "x64").
+fn target_label(os: &str, arch: &str) -> String {
+    let os = match os {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    };
+    let arch = match (os, arch) {
+        ("macOS", "aarch64") => "Apple Silicon",
+        ("macOS", "x86_64") => "Intel Chip",
+        (_, "aarch64") => "Arm64",
+        (_, "x86_64") => "x86_64",
+        (_, other) => other,
+    };
+    format!("{os} ({arch})")
+}
+
+fn build_target_label() -> String {
+    target_label(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 /// Show the fatal error inside the splash window instead of exiting blindly.
@@ -829,8 +859,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Show a splash window immediately: first launch extracts ~200 MB
-            // and restores ~300 links before the server can answer, which used
-            // to look like a dead launch (no window for a minute or more).
+            // before the server can answer, which used to look like a dead
+            // launch (no window for a minute or more).
             // Heavy work runs on a worker thread; the splash navigates to the
             // server once /api/health is green, or shows the fatal error.
             //
@@ -933,6 +963,24 @@ mod tests {
         // splash -> main handoff) must not kill the server.
         assert!(!owns_server("splash"));
         assert!(!owns_server(""));
+    }
+
+    #[test]
+    fn target_label_reads_like_a_download_page() {
+        assert_eq!(target_label("macos", "aarch64"), "macOS (Apple Silicon)");
+        assert_eq!(target_label("macos", "x86_64"), "macOS (Intel)");
+        assert_eq!(target_label("windows", "x86_64"), "Windows (x64)");
+        assert_eq!(target_label("windows", "aarch64"), "Windows (ARM64)");
+        assert_eq!(target_label("linux", "x86_64"), "Linux (x64)");
+        // An arch nobody has named yet stays literal rather than being guessed.
+        assert_eq!(target_label("linux", "arm"), "Linux (arm)");
+        // Tripwire: a new build target must be given human wording here, not
+        // leak a raw triple fragment into the splash.
+        let live = build_target_label();
+        assert!(
+            live.contains('(') && !live.contains("x86_64") && !live.contains("aarch64"),
+            "unmapped target label: {live}"
+        );
     }
 
     #[test]
