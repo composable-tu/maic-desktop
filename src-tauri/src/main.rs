@@ -423,6 +423,40 @@ fn verify_server_tree(server_dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve a module the way Node would from a given anchor path, using the
+/// actual Node binary. Kept for manual diagnostics: the behavioral probe
+/// (running the real server and reading its log) proved more reliable than
+/// static or resolver-level checks, because Next's require-hook aliases
+/// redirect resolution through the next/ store dir in ways `require.resolve`
+/// from an arbitrary anchor does not reproduce.
+#[cfg(test)]
+fn node_can_resolve(
+    node_bin: &std::path::Path,
+    request: &str,
+    from_file: &str,
+) -> Result<(), String> {
+    // require.resolve with paths pinned to the server tree — same algorithm
+    // the server uses, no server code executed (fails in <1s or not at all).
+    let mut probe = String::from("try { require.resolve(");
+    probe.push_str(&format!("{request:?}, "));
+    probe.push_str(&format!("{{ paths: [{from_file:?}] }}));"));
+    probe.push_str("console.log('MAIC_RESOLVE_OK'); } catch (e) { console.error(String(e && e.message || e)); process.exit(1); }");
+    let mut cmd = Command::new(node_bin);
+    cmd.arg("-e").arg(probe);
+    #[cfg(windows)]
+    hide_console(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("resolve probe failed to run: {e}"))?;
+    if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("MAIC_RESOLVE_OK") {
+        return Ok(());
+    }
+    Err(format!(
+        "node cannot resolve {request:?} (from {from_file}): {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
 /// Create a directory link: junction on Windows, symlink on unix.
 /// Junctions use an absolute target so they survive regardless of the
 /// process working directory.
@@ -838,6 +872,13 @@ fn parse_url(url: &str) -> Option<(String, u16, String)> {
 
 /// Spawn the sidecar and block until /api/health is green.
 /// Returns the base URL plus the child handle (killed on app exit).
+///
+/// Self-heal: a crash whose log shows MODULE_NOT_FOUND means the staged tree's
+/// restored link layout is broken in a way static checks cannot see (Windows
+/// junction chains resolve differently under Node than under
+/// `fs::canonicalize`; verified locally). In that case the tree is re-extracted
+/// from the bundled tarball exactly once and startup retried — the fresh
+/// extraction restores every link from `.links.json`.
 fn start_server(
     app: &tauri::AppHandle,
     server_dir: &std::path::Path,
@@ -851,98 +892,133 @@ fn start_server(
         ));
     }
 
-    // First attempt uses the sticky port (keeps the origin — and therefore
-    // IndexedDB/localStorage — stable across launches). Fall back to fresh
-    // ports if it is busy (e.g. a second instance).
-    let mut first: Option<u16> = match pick_sticky_port(app) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            eprintln!("maic-desktop: sticky port unavailable ({e}), allocating fresh");
-            None
-        }
-    };
+    let mut healed = false;
     let mut last_err = String::new();
-    for _ in 0..MAX_PORT_ATTEMPTS {
-        let port = match first.take() {
-            Some(p) => p,
-            None => pick_free_port()?,
-        };
-        let mut cmd = Command::new(node_bin);
-        cmd.arg(server_js.to_string_lossy().to_string())
-            .env("PORT", port.to_string())
-            .env("HOSTNAME", "127.0.0.1")
-            .env("NODE_ENV", "production")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        hide_console(&mut cmd);
-        let child = cmd.spawn();
-
-        match child {
-            Ok(mut child) => {
-                // Keep the tail of server output: on failure it goes into the
-                // fatal dialog, so a bug report carries the real Node error.
-                let log: std::sync::Arc<Mutex<String>> =
-                    std::sync::Arc::new(Mutex::new(String::new()));
-                // Drain pipes so a chatty server log can't block on a full buffer.
-                if let Some(out) = child.stdout.take() {
-                    let log = std::sync::Arc::clone(&log);
-                    std::thread::spawn(move || {
-                        use std::io::BufRead;
-                        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                            println!("[server] {line}");
-                            push_log(&log, &line);
-                        }
-                    });
-                }
-                if let Some(err) = child.stderr.take() {
-                    let log = std::sync::Arc::clone(&log);
-                    std::thread::spawn(move || {
-                        use std::io::BufRead;
-                        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
-                            eprintln!("[server] {line}");
-                            push_log(&log, &line);
-                        }
-                    });
-                }
-
-                match wait_for_health(port, &mut child) {
-                    HealthOutcome::Healthy => {
-                        // Record the port that actually serves, so the next launch
-                        // reuses it and the origin (IndexedDB/localStorage) stays put.
-                        if let Ok(data_dir) = app.path().app_data_dir() {
-                            let _ =
-                                std::fs::write(data_dir.join("server-port.json"), port.to_string());
-                        }
-                        return Ok((format!("http://127.0.0.1:{port}/"), child));
-                    }
-                    outcome => {
-                        // Give the drain threads a moment to flush the exit error.
-                        std::thread::sleep(Duration::from_millis(500));
-                        let tail = log.lock().map(|g| g.clone()).unwrap_or_default();
-                        let _ = child.kill();
-                        last_err = match outcome {
-                            HealthOutcome::NoListener => format!(
-                                "server on port {port} never accepted connections (it likely crashed on startup){}",
-                                format_log_tail(&tail),
-                            ),
-                            _ => format!(
-                                "server on port {port} never became healthy{}",
-                                format_log_tail(&tail),
-                            ),
-                        };
-                        // Try another port.
-                    }
-                }
-            }
+    loop {
+        // First attempt uses the sticky port (keeps the origin — and therefore
+        // IndexedDB/localStorage — stable across launches). Fall back to fresh
+        // ports if it is busy (e.g. a second instance).
+        let mut first: Option<u16> = match pick_sticky_port(app) {
+            Ok(p) => Some(p),
             Err(e) => {
-                last_err = format!("failed to spawn bundled node (port busy?): {e}");
+                eprintln!("maic-desktop: sticky port unavailable ({e}), allocating fresh");
+                None
+            }
+        };
+        for _ in 0..MAX_PORT_ATTEMPTS {
+            let port = match first.take() {
+                Some(p) => p,
+                None => pick_free_port()?,
+            };
+            let mut cmd = Command::new(node_bin);
+            cmd.arg(server_js.to_string_lossy().to_string())
+                .env("PORT", port.to_string())
+                .env("HOSTNAME", "127.0.0.1")
+                .env("NODE_ENV", "production")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            hide_console(&mut cmd);
+            let child = cmd.spawn();
+
+            match child {
+                Ok(mut child) => {
+                    // Keep the tail of server output: on failure it goes into
+                    // the fatal dialog, so a bug report carries the real Node
+                    // error.
+                    let log: std::sync::Arc<Mutex<String>> =
+                        std::sync::Arc::new(Mutex::new(String::new()));
+                    // Drain pipes so a chatty server log can't block on a full
+                    // buffer.
+                    if let Some(out) = child.stdout.take() {
+                        let log = std::sync::Arc::clone(&log);
+                        std::thread::spawn(move || {
+                            use std::io::BufRead;
+                            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                                println!("[server] {line}");
+                                push_log(&log, &line);
+                            }
+                        });
+                    }
+                    if let Some(err) = child.stderr.take() {
+                        let log = std::sync::Arc::clone(&log);
+                        std::thread::spawn(move || {
+                            use std::io::BufRead;
+                            for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                                eprintln!("[server] {line}");
+                                push_log(&log, &line);
+                            }
+                        });
+                    }
+
+                    match wait_for_health(port, &mut child) {
+                        HealthOutcome::Healthy => {
+                            // Record the port that actually serves, so the next
+                            // launch reuses it and the origin
+                            // (IndexedDB/localStorage) stays put.
+                            if let Ok(data_dir) = app.path().app_data_dir() {
+                                let _ = std::fs::write(
+                                    data_dir.join("server-port.json"),
+                                    port.to_string(),
+                                );
+                            }
+                            return Ok((format!("http://127.0.0.1:{port}/"), child));
+                        }
+                        outcome => {
+                            // Give the drain threads a moment to flush the
+                            // exit error.
+                            std::thread::sleep(Duration::from_millis(500));
+                            let tail = log.lock().map(|g| g.clone()).unwrap_or_default();
+                            let _ = child.kill();
+                            last_err = match outcome {
+                                HealthOutcome::NoListener => format!(
+                                    "server on port {port} never accepted connections (it likely crashed on startup){}",
+                                    format_log_tail(&tail),
+                                ),
+                                _ => format!(
+                                    "server on port {port} never became healthy{}",
+                                    format_log_tail(&tail),
+                                ),
+                            };
+                            // Broken staged tree (MODULE_NOT_FOUND in the log):
+                            // re-extract once — a fresh extraction restores
+                            // every link from .links.json — then retry from the
+                            // top. `healed` guarantees this happens at most
+                            // once, so a genuinely bad bundle still reports its
+                            // error after the next full pass.
+                            if tail.contains("MODULE_NOT_FOUND") && !healed {
+                                healed = true;
+                                eprintln!(
+                                    "maic-desktop: server crashed with MODULE_NOT_FOUND; re-extracting server tree and retrying"
+                                );
+                                let tarball = app
+                                    .path()
+                                    .resolve("resources/server.tar.gz", BaseDirectory::Resource)
+                                    .map_err(|e| format!("failed to resolve resources: {e}"))?;
+                                let data_dir = app
+                                    .path()
+                                    .app_data_dir()
+                                    .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+                                let staged_meta = read_bundled_meta(&tarball)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                stage_fresh_server(&tarball, &data_dir, server_dir, &staged_meta)?;
+                                continue;
+                            }
+                            // Try another port.
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = format!("failed to spawn bundled node (port busy?): {e}");
+                }
             }
         }
+        // All port attempts exhausted without a healthy server (and without a
+        // healable crash): report the last real error.
+        return Err(format!(
+            "could not start the bundled MAIC server after {MAX_PORT_ATTEMPTS} attempts. {last_err}"
+        ));
     }
-    Err(format!(
-        "could not start the bundled MAIC server after {MAX_PORT_ATTEMPTS} attempts. {last_err}"
-    ))
 }
 
 /// Append a line to the shared tail buffer, keeping roughly the last 4 KB.
