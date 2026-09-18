@@ -65,6 +65,15 @@
         letter-spacing: -0.01em; line-height: 1.15; white-space: nowrap;
       }
       #status { font-size: clamp(13px, 3.5vw, 15px); color: #888; min-height: 1.2em; white-space: nowrap; }
+      /* Two stacked cells: .sizer holds the widest line ever pushed, so the
+         row's centered width stops depending on which status is showing. */
+      #status { display: grid; }
+      #status > span { grid-area: 1 / 1; justify-self: start; }
+      #status .sizer { visibility: hidden; }
+      /* Status lines used to hard-cut; a short rise-in makes the swap read as
+         progress rather than a flicker. */
+      @keyframes statusIn { from { opacity: 0; transform: translateY(4px); } }
+      #status.in { animation: statusIn 180ms ease-out; }
       #error {
         display: none;
         flex: 1 1 auto; min-height: 0;
@@ -92,21 +101,36 @@
       <div class="line" id="bar"><div></div></div>
       <div class="text">
         <h1>MAIC Desktop</h1>
-        <div id="status">Preparing local server…</div>
+        <div id="status"><span class="cur">Preparing local server…</span><span class="sizer" aria-hidden="true"></span></div>
       </div>
     </div>
     <div id="error"></div>
     <div class="footer"><span>Unofficial OpenMAIC Desktop</span><span id="target"></span></div>
     <script>
+      var statusEl = document.getElementById('status');
+      var curEl = statusEl.querySelector('.cur');
+      var sizerEl = statusEl.querySelector('.sizer');
       window.__maicStatus = function (text) {
-        document.getElementById('status').textContent = text;
+        var changed = curEl.textContent !== text;
+        if (changed) curEl.textContent = text;
+        // Grow the reserved width only, so a longer line can never re-center
+        // the row and slide the logo and title sideways. Runs even when the
+        // text is unchanged: the shell re-sends the line the page ships with.
+        if (curEl.offsetWidth > sizerEl.offsetWidth) sizerEl.textContent = curEl.textContent;
+        if (!changed) return;
+        statusEl.classList.remove('in');
+        void statusEl.offsetWidth; // reflow, so the next push replays the animation
+        statusEl.classList.add('in');
       };
+      // Reserve the shipping line now, rather than only when the shell pushes
+      // it: an eval that arrives before this document exists is dropped.
+      window.__maicStatus(curEl.textContent);
       window.__maicTarget = function (text) {
         document.getElementById('target').textContent = text;
       };
       window.__maicFatal = function (message) {
         document.body.classList.add('has-error');
-        document.getElementById('status').textContent = 'Startup failed';
+        window.__maicStatus('Startup failed');
         document.getElementById('bar').classList.add('done');
         var el = document.getElementById('error');
         el.textContent = message;
