@@ -292,19 +292,11 @@ async function stageNodeBinary(triple, version) {
     await fs.copyFile(outPath, shuffled);
     await fs.rename(shuffled, outPath);
     await fs.chmod(outPath, 0o755);
-    if (spec.nodeOs === 'darwin') {
-      // The official Node binary carries a full Developer ID signature. When a
-      // GUI app spawns it, LaunchServices enrolls it as a Foreground app under
-      // our bundle id — and since it never opens a window, its Dock tile
-      // bounces forever. Re-signing ad-hoc drops the Team ID, so the sidecar
-      // registers as BackgroundOnly and stays out of the Dock. Verified with
-      // `lsappinfo list` (Foreground -> BackgroundOnly).
-      try {
-        run('codesign', ['--force', '-s', '-', outPath]);
-      } catch {
-        console.warn('warning: codesign not available, Dock bouncing may occur on macOS');
-      }
-    }
+    // NOTE: do NOT ad-hoc re-sign here. An ad-hoc signature drops the
+    // Team ID, and AMFI kills GUI-app-spawned ad-hoc binaries on launch
+    // while letting the same binary run from a terminal. Keep the official
+    // Node.js Developer ID signature; Dock handling is done at runtime.
+
   }
   await fs.rm(tmp, { recursive: true, force: true });
   // Sanity: a 0-byte (or missing) placeholder must never be bundled as the

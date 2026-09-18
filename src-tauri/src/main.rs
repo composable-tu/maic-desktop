@@ -1,14 +1,16 @@
 // main.rs — MAIC Desktop shell.
 //
-// Boot flow (all on the main thread, inside `setup`):
-//  1. Ensure the bundled server tree is extracted to the app data dir
+// Boot flow:
+//  1. `setup` (main thread) shows the splash window immediately, then spawns
+//     a worker thread for the heavy work below.
+//  2. Worker: ensure the bundled server tree is extracted to the app data dir
 //     (shipped as server.tar.gz because bundlers don't preserve symlinks;
 //     skipped when the staged .build-meta.json already matches).
-//  2. Pick a free loopback port from the OS.
-//  3. Spawn the bundled Node sidecar running the Next.js standalone server
+//  3. Pick a free loopback port from the OS.
+//  4. Spawn the bundled Node sidecar running the Next.js standalone server
 //     with PORT/HOSTNAME pointed at it.
-//  4. Poll /api/health until it responds 200 (or time out with a fatal dialog).
-//  5. Open the main window against the local server.
+//  5. Poll /api/health until it responds 200 (or time out with a fatal dialog).
+//  6. Close the splash window and open the main window against the local server.
 //
 // Exiting the app terminates the sidecar. No system Node.js is required.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -605,10 +607,17 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
 
     // A stale-but-marker-matching binary (e.g. quarantined copy that gets
     // SIGKILLed on exec) must not be trusted: probe it before use.
+    // Note: --version can pass while server.js gets SIGKILLed (Gatekeeper
+    // judges GUI-app children more strictly), so on macOS we additionally
+    // re-wash every launch — a local 112MB copy round-trip takes ~1s.
     if current == staged_meta && staged.exists() && !sidecar_is_usable(&staged) {
         eprintln!("maic-desktop: staged sidecar failed exec probe, re-staging");
         let _ = std::fs::remove_file(&staged);
     }
+    #[cfg(target_os = "macos")]
+    let wash_each_launch = true;
+    #[cfg(not(target_os = "macos"))]
+    let wash_each_launch = false;
 
     if current != staged_meta || !staged.exists() {
         std::fs::create_dir_all(&bin_dir).map_err(|e| format!("failed to create bin dir: {e}"))?;
@@ -648,6 +657,17 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
         std::fs::write(&marker, staged_meta)
             .map_err(|e| format!("failed to write sidecar marker: {e}"))?;
         println!("maic-desktop: staged sidecar outside bundle");
+    } else if wash_each_launch {
+        // Marker matches but Gatekeeper judges GUI-app children per-exec:
+        // re-wash so a fresh enforcement decision can't SIGKILL the server.
+        // Local copy round-trip, ~1s for 112MB.
+        #[cfg(target_os = "macos")]
+        {
+            let tmp = bin_dir.join(format!("openmaic-node{ext}.stage"));
+            if std::fs::copy(&staged, &tmp).is_ok() && std::fs::rename(&tmp, &staged).is_ok() {
+                println!("maic-desktop: re-washed staged sidecar");
+            }
+        }
     }
     Ok(staged)
 }
@@ -915,15 +935,24 @@ fn boot_in_background(app: &tauri::AppHandle) {
         Ok(u) => u,
         Err(msg) => return boot_failed(app, &msg),
     };
-    if let Some(splash) = app.get_webview_window("splash") {
-        let _ = splash.close();
-    }
-    if let Err(e) = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(parsed))
-        .title("MAIC Desktop")
-        .inner_size(1280.0, 800.0)
-        .build()
-    {
-        boot_failed(app, &format!("failed to create main window: {e}"));
+    // Windows MUST be created on the main thread: building the main window
+    // here (worker thread) silently fails, leaving no windows at all — the
+    // runtime then exits and takes the healthy server down with it. That is
+    // exactly the "splash then nothing" symptom.
+    let handle = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || {
+        if let Some(splash) = handle.get_webview_window("splash") {
+            let _ = splash.close();
+        }
+        if let Err(e) = WebviewWindowBuilder::new(&handle, "main", WebviewUrl::External(parsed))
+            .title("MAIC Desktop")
+            .inner_size(1280.0, 800.0)
+            .build()
+        {
+            boot_failed(&handle, &format!("failed to create main window: {e}"));
+        }
+    }) {
+        boot_failed(app, &format!("failed to schedule main window: {e}"));
     }
 }
 
@@ -962,6 +991,13 @@ fn boot_failed(app: &tauri::AppHandle, message: &str) {
     fatal(app, message);
 }
 
+/// Whether destroying the window with this label should tear down the server.
+/// Only "main" owns the server lifetime: "splash" closes during the
+/// splash -> main handoff while the server must keep running for main.
+fn owns_server(label: &str) -> bool {
+    label == "main"
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -978,6 +1014,11 @@ fn main() {
             // about:blank isn't ready, which produced the blank window).
             // WebviewUrl::App is avoided: in `tauri dev` it resolves to the
             // dev server (404) and asset-protocol quirks differ per OS.
+            // Release: load the compiled-in page through the asset protocol
+            // (reliable, no timing race). Dev: WebviewUrl::App would resolve
+            // to the Next dev server (404), so use about:blank plus an
+            // initialization script that document.writes the same page.
+            // Both paths render identical content.
             const SPLASH_HTML: &str = include_str!("../frontend-dist/splash.html");
             // initialization_script takes plain JS: document.write the page.
             // Escape for a JS string literal.
@@ -993,26 +1034,29 @@ fn main() {
                 }
             }
             init_js.push_str("\");document.close();");
-            WebviewWindowBuilder::new(
-                app,
-                "splash",
-                WebviewUrl::External(
-                    "about:blank"
-                        .parse()
-                        .map_err(|e| format!("bad blank url: {e}"))?,
-                ),
-            )
-            .title("MAIC Desktop")
-            .inner_size(420.0, 300.0)
-            .center()
-            .resizable(false)
-            .decorations(false)
-            .visible(true)
-            // Native window background before the webview paints its first
-            // frame (covers the white flash, esp. on WebView2).
-            .background_color(tauri::window::Color(0, 0, 0, 255))
-            .initialization_script(&init_js)
-            .build()?;
+            #[cfg(not(debug_assertions))]
+            let splash_url = WebviewUrl::App("splash.html".into());
+            #[cfg(debug_assertions)]
+            let splash_url = WebviewUrl::External(
+                "about:blank"
+                    .parse()
+                    .map_err(|e| format!("bad blank url: {e}"))?,
+            );
+            let mut builder = WebviewWindowBuilder::new(app, "splash", splash_url)
+                .title("MAIC Desktop")
+                .inner_size(420.0, 300.0)
+                .center()
+                .resizable(false)
+                .decorations(false)
+                .visible(true)
+                // Native window background before the webview paints its first
+                // frame (covers the white flash, esp. on WebView2).
+                .background_color(tauri::window::Color(0, 0, 0, 255));
+            #[cfg(debug_assertions)]
+            {
+                builder = builder.initialization_script(&init_js);
+            }
+            builder.build()?;
 
             let handle = app.handle().clone();
             std::thread::spawn(move || boot_in_background(&handle));
@@ -1020,6 +1064,14 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                // Splash closes during the splash -> main handoff while the
+                // server must stay alive for the main window. Only tear the
+                // server down when main itself is destroyed (RunEvent::Exit
+                // below is the final backup). Without this guard, closing
+                // the splash kills the healthy server and main opens blank.
+                if !owns_server(window.label()) {
+                    return;
+                }
                 if let Some(state) = window.app_handle().try_state::<ServerChild>() {
                     if let Ok(mut guard) = state.0.lock() {
                         if let Some(mut child) = guard.take() {
@@ -1048,6 +1100,15 @@ fn main() {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn only_main_owns_server_lifetime() {
+        assert!(owns_server("main"));
+        // Closing any other window (notably the splash during the
+        // splash -> main handoff) must not kill the server.
+        assert!(!owns_server("splash"));
+        assert!(!owns_server(""));
+    }
 
     #[test]
     fn parse_manifest_round_trip() {
