@@ -133,32 +133,56 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let server_dir = data_dir.join("server");
 
     if current != staged_meta || !server_dir.join("server.js").exists() {
-        println!("maic-desktop: extracting server runtime (first launch or update)…");
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|e| format!("failed to create app data dir: {e}"))?;
-        // Remove any previous tree so stale files can't shadow the new build.
-        // Fail loudly here: extracting over a half-removed tree (e.g. locked
-        // junctions on Windows) produces a corrupt server that dies later
-        // with a confusing module error.
-        if server_dir.exists() {
-            std::fs::remove_dir_all(&server_dir).map_err(|e| {
-                format!(
-                    "failed to clear previous server at {} (is another instance running?): {e}",
-                    server_dir.display()
-                )
-            })?;
-        }
-        extract_tarball(&tarball, &data_dir)?;
-        // Recreate the pnpm symlink layout (the tarball carries none).
-        restore_links(&server_dir)?;
-        // Fail fast with a precise message instead of a deep MODULE_NOT_FOUND.
-        verify_server_tree(&server_dir)?;
-        std::fs::write(&marker, &staged_meta)
-            .map_err(|e| format!("failed to write build marker: {e}"))?;
+        stage_fresh_server(&tarball, &data_dir, &server_dir, &staged_meta)?;
     } else {
         println!("maic-desktop: reusing extracted server runtime");
+        // A reused tree is not necessarily healthy: links can go missing
+        // after staging (cleaner tools, AV quarantine, a crash mid-restore)
+        // while the marker still matches. Top up links and re-verify on
+        // every launch — cheap (~300 stats) — and re-extract once when
+        // broken instead of crash-looping the server 5 times. (This is the
+        // Windows "@swc/helpers MODULE_NOT_FOUND": the marker matched, so
+        // the damaged tree was trusted blindly.)
+        if let Err(e) = restore_links(&server_dir).and_then(|_| verify_server_tree(&server_dir)) {
+            eprintln!("maic-desktop: staged server failed validation ({e}); re-extracting");
+            stage_fresh_server(&tarball, &data_dir, &server_dir, &staged_meta)?;
+        }
     }
     Ok(server_dir)
+}
+
+/// Extract the tarball and stage a fresh server tree: unpack, restore the
+/// pnpm link layout (the tarball ships zero symlinks), verify it can boot,
+/// then record the marker. Used for first launch, updates, and one-shot
+/// repair of a damaged staged tree.
+fn stage_fresh_server(
+    tarball: &std::path::Path,
+    data_dir: &std::path::Path,
+    server_dir: &std::path::Path,
+    staged_meta: &str,
+) -> Result<(), String> {
+    println!("maic-desktop: extracting server runtime (first launch or update)…");
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("failed to create app data dir: {e}"))?;
+    // Remove any previous tree so stale files can't shadow the new build.
+    // Fail loudly here: extracting over a half-removed tree (e.g. locked
+    // junctions on Windows) produces a corrupt server that dies later
+    // with a confusing module error.
+    if server_dir.exists() {
+        std::fs::remove_dir_all(server_dir).map_err(|e| {
+            format!(
+                "failed to clear previous server at {} (is another instance running?): {e}",
+                server_dir.display()
+            )
+        })?;
+    }
+    extract_tarball(tarball, data_dir)?;
+    // Recreate the pnpm symlink layout (the tarball carries none).
+    restore_links(server_dir)?;
+    // Fail fast with a precise message instead of a deep MODULE_NOT_FOUND.
+    verify_server_tree(server_dir)?;
+    std::fs::write(data_dir.join(".build-meta.json"), staged_meta)
+        .map_err(|e| format!("failed to write build marker: {e}"))?;
+    Ok(())
 }
 
 /// Suppress the console window for helper child processes on Windows.
@@ -700,7 +724,7 @@ enum HealthOutcome {
     NoListener,
 }
 
-fn wait_for_health(port: u16) -> HealthOutcome {
+fn wait_for_health(port: u16, child: &mut Child) -> HealthOutcome {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut ever_listened = false;
     while Instant::now() < deadline {
@@ -710,6 +734,17 @@ fn wait_for_health(port: u16) -> HealthOutcome {
             if let Ok(true) = http_get_ok(&url) {
                 return HealthOutcome::Healthy;
             }
+        }
+        // The server process already exited (e.g. MODULE_NOT_FOUND on
+        // startup): don't burn the full timeout on this attempt. Without
+        // this, a crash-on-startup loops 5 attempts x 60s stuck on
+        // "Starting local server…" before surfacing the real error.
+        // (Health is checked first, so hitching onto another live instance's
+        // port still counts as healthy.)
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => break,
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -834,7 +869,7 @@ fn start_server(
                     });
                 }
 
-                match wait_for_health(port) {
+                match wait_for_health(port, &mut child) {
                     HealthOutcome::Healthy => {
                         // Record the port that actually serves, so the next launch
                         // reuses it and the origin (IndexedDB/localStorage) stays put.
