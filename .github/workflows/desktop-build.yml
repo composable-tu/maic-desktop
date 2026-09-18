@@ -1,20 +1,23 @@
 name: desktop-build
 
 # Full 4-platform desktop builds. Artifacts only (90-day retention), no releases.
-# Tags like desktop-v* are build triggers only — nothing is published to Releases.
 #
 # Cost note: the matrix fans out to 2 macOS + 2 Windows runners, each doing a
-# full Next build + Node download + Rust compile. It runs on release tags and
-# manual dispatch ONLY — every main push is already covered by the cheap
-# Linux smoke job in desktop-check.yml.
+# full Next build + Node download + Rust compile. It runs on main pushes whose
+# head commit message starts with [build], plus manual dispatch — ordinary
+# main pushes are covered by the cheap Linux smoke job in desktop-check.yml.
 
 on:
   push:
-    tags: ["desktop-v*"]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
+    # Skip unless the head commit asks for a full build. Keeps `main` pushes
+    # cheap by default; use a `[build] ...` message (or Run workflow) for
+    # real installers.
+    if: startsWith(github.event.head_commit.message, '[build]') || github.event_name == 'workflow_dispatch'
     # Matrix-aware group (job-level, so `matrix` is in scope): a shared
     # top-level group with cancel-in-progress makes parallel platform
     # jobs cancel each other. New pushes supersede only the same-target run.
