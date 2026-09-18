@@ -100,6 +100,11 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
                 "maic-desktop: using dev server tree at {}",
                 dev_dir.display()
             );
+            // The staged tree ships zero symlinks (stripped before packing),
+            // so the dev tree needs the same link restore as an extraction.
+            // Idempotent: existing entries are skipped.
+            restore_links(&dev_dir)?;
+            verify_server_tree(&dev_dir)?;
             return Ok(dev_dir);
         }
     }
@@ -144,6 +149,8 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         extract_tarball(&tarball, &data_dir)?;
         // Recreate the pnpm symlink layout (the tarball carries none).
         restore_links(&server_dir)?;
+        // Fail fast with a precise message instead of a deep MODULE_NOT_FOUND.
+        verify_server_tree(&server_dir)?;
         std::fs::write(&marker, &staged_meta)
             .map_err(|e| format!("failed to write build marker: {e}"))?;
     } else {
@@ -205,7 +212,18 @@ fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
     let manifest_path = server_dir.join(".links.json");
     let text = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("link manifest missing at {}: {e}", manifest_path.display()))?;
-    let links = parse_links_manifest(&text)?;
+    let mut links = parse_links_manifest(&text)?;
+    // Restore deepest store paths first: pnpm's layout nests links inside
+    // store dirs (e.g. .../next@.../node_modules/@swc/helpers), and a parent
+    // restored before its target's parent can shadow resolution on Windows.
+    // Sorting by link depth (deepest first) approximates topological order for
+    // this flat store layout without a full dependency graph.
+    links.sort_by(|a, b| {
+        b.0.matches('/')
+            .count()
+            .cmp(&a.0.matches('/').count())
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let mut restored = 0u32;
     let mut copied = 0u32;
     for (link_rel, target_rel) in links {
@@ -237,6 +255,108 @@ fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
         }
     }
     println!("maic-desktop: restored {restored} dir links, materialized {copied} files");
+    Ok(())
+}
+
+/// Verify the server tree can actually boot Node resolution before spawning.
+/// Checks the exact chain Next.js standalone relies on: `server.js` exists,
+/// `node_modules/next` resolves (junction/symlink or dir) into a tree holding
+/// `dist/`, and `@swc/helpers` resolves with its `exports` map plus the
+/// runtime helper files Node ≥22 selects (`esm/` via module-sync, `cjs/` via
+/// default). Without this, a missing junction surfaces pages later as a bare
+/// `Cannot find module '@swc/helpers/_/...'` with no hint which link broke.
+fn verify_server_tree(server_dir: &std::path::Path) -> Result<(), String> {
+    let server_js = server_dir.join("server.js");
+    if !server_js.is_file() {
+        return Err(format!(
+            "server tree incomplete: {} missing",
+            server_js.display()
+        ));
+    }
+    let next_dir = server_dir.join("node_modules").join("next");
+    // Resolve through junction/symlink: metadata follows links.
+    let next_real = std::fs::metadata(&next_dir).map_err(|_| {
+        format!(
+            "server tree incomplete: {} missing or unrestored (pnpm junction for `next` not recreated — check .links.json restore)",
+            next_dir.display()
+        )
+    })?;
+    if !next_real.is_dir() {
+        return Err(format!(
+            "server tree incomplete: {} is not a directory",
+            next_dir.display()
+        ));
+    }
+    // Canonicalize to the real location for the remaining probes so nested
+    // junctions (e.g. .../next@.../node_modules/@swc/helpers) are followed.
+    let next_canon = std::fs::canonicalize(&next_dir)
+        .map_err(|e| format!("cannot resolve {}: {e}", next_dir.display()))?;
+    if !next_canon.join("dist").join("server").is_dir() {
+        return Err(format!(
+            "server tree incomplete: next dist missing under {}",
+            next_canon.display()
+        ));
+    }
+    // Walk up from the real next/ dir like Node does, looking for a usable
+    // @swc/helpers package (exports map + at least one runtime helper file).
+    let mut anchor: Option<&std::path::Path> = None;
+    let mut cur = next_canon.as_path();
+    loop {
+        let cand = cur.join("node_modules").join("@swc").join("helpers");
+        if let Ok(md) = std::fs::metadata(&cand) {
+            if md.is_dir() {
+                anchor = Some(cur);
+                break;
+            }
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    // Fall back to the pnpm hoisted bridge used when present.
+    let bridge = server_dir
+        .join("node_modules")
+        .join(".pnpm")
+        .join("node_modules")
+        .join("@swc")
+        .join("helpers");
+    let helpers_dir = match anchor {
+        Some(a) => a.join("node_modules").join("@swc").join("helpers"),
+        None => bridge.clone(),
+    };
+    let pkg_path = helpers_dir.join("package.json");
+    let pkg_text = std::fs::read_to_string(&pkg_path).map_err(|_| {
+        format!(
+            "server tree incomplete: @swc/helpers unresolvable from {} (junction chain broken — expected via {} or hoisted {})",
+            next_canon.display(),
+            anchor
+                .map(|a| a.join("node_modules").join("@swc").join("helpers").display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            bridge.display(),
+        )
+    })?;
+    if !pkg_text.contains("\"./_/_interop_require_default\"") {
+        return Err(format!(
+            "@swc/helpers exports map missing ./_/_interop_require_default in {}",
+            pkg_path.display()
+        ));
+    }
+    // Canonicalize again: helpers_dir itself may be a junction.
+    let helpers_canon = std::fs::canonicalize(&helpers_dir)
+        .map_err(|e| format!("cannot resolve {}: {e}", helpers_dir.display()))?;
+    let esm = helpers_canon
+        .join("esm")
+        .join("_interop_require_default.js");
+    let cjs = helpers_canon
+        .join("cjs")
+        .join("_interop_require_default.cjs");
+    if !esm.is_file() && !cjs.is_file() {
+        return Err(format!(
+            "@swc/helpers runtime files missing under {} (need esm/_interop_require_default.js or cjs/_interop_require_default.cjs — Next standalone tracing may have pruned them)",
+            helpers_canon.display()
+        ));
+    }
     Ok(())
 }
 
@@ -483,6 +603,13 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
     let marker = bin_dir.join(".sidecar-meta.json");
     let current = std::fs::read_to_string(&marker).unwrap_or_default();
 
+    // A stale-but-marker-matching binary (e.g. quarantined copy that gets
+    // SIGKILLed on exec) must not be trusted: probe it before use.
+    if current == staged_meta && staged.exists() && !sidecar_is_usable(&staged) {
+        eprintln!("maic-desktop: staged sidecar failed exec probe, re-staging");
+        let _ = std::fs::remove_file(&staged);
+    }
+
     if current != staged_meta || !staged.exists() {
         std::fs::create_dir_all(&bin_dir).map_err(|e| format!("failed to create bin dir: {e}"))?;
         std::fs::copy(&bundled, &staged).map_err(|e| format!("failed to stage sidecar: {e}"))?;
@@ -496,11 +623,50 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
             std::fs::set_permissions(&staged, perm)
                 .map_err(|e| format!("failed to chmod staged sidecar: {e}"))?;
         }
+        #[cfg(target_os = "macos")]
+        {
+            // fs::copy preserves the com.apple.provenance marker, and the
+            // staged copy gets SIGKILLed on exec. A copy round-trip sheds the
+            // enforcement (same trick as prepare-server's staging). The binary
+            // is already ad-hoc signed at stage time; the round-trip keeps it.
+            let tmp = bin_dir.join(format!("openmaic-node{ext}.stage"));
+            std::fs::copy(&staged, &tmp)
+                .map_err(|e| format!("failed to wash staged sidecar: {e}"))?;
+            std::fs::rename(&tmp, &staged)
+                .map_err(|e| format!("failed to wash staged sidecar: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perm = std::fs::metadata(&staged)
+                    .map_err(|e| format!("failed to stat staged sidecar: {e}"))?
+                    .permissions();
+                perm.set_mode(0o755);
+                std::fs::set_permissions(&staged, perm)
+                    .map_err(|e| format!("failed to chmod staged sidecar: {e}"))?;
+            }
+        }
         std::fs::write(&marker, staged_meta)
             .map_err(|e| format!("failed to write sidecar marker: {e}"))?;
         println!("maic-desktop: staged sidecar outside bundle");
     }
     Ok(staged)
+}
+
+/// Probe whether the staged sidecar can actually be executed (short-lived
+/// `--version` run). Catches quarantined/SIGKILLed copies that exist on disk
+/// and match the version marker but die instantly when spawned — without
+/// this, boot burns all port attempts waiting on a stillborn server.
+fn sidecar_is_usable(bin: &std::path::Path) -> bool {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    hide_console(&mut cmd);
+    match cmd.output() {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
 }
 
 /// Outcome of waiting for the server to become healthy.
@@ -717,43 +883,139 @@ fn format_log_tail(tail: &str) -> String {
 /// App state holding the server child so it can be killed on exit.
 struct ServerChild(Mutex<Option<Child>>);
 
+/// Heavy boot work off the main thread: extract, stage, serve, then swap
+/// the splash window for the real one. Runs on a worker thread; UI updates
+/// go through the AppHandle (send-safe).
+fn boot_in_background(app: &tauri::AppHandle) {
+    // Bundled build marker (also used to version the staged sidecar copy).
+    let tarball = app
+        .path()
+        .resolve("resources/server.tar.gz", BaseDirectory::Resource)
+        .map(|t| read_bundled_meta(&t).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|_| "{}".to_string());
+    splash_status(app, "Preparing local server…");
+    let server_dir = match ensure_server(app) {
+        Ok(dir) => dir,
+        Err(msg) => return boot_failed(app, &msg),
+    };
+    let node_bin = match ensure_sidecar(app, &tarball) {
+        Ok(bin) => bin,
+        Err(msg) => return boot_failed(app, &msg),
+    };
+    splash_status(app, "Starting local server…");
+    let (url, child) = match start_server(app, &server_dir, &node_bin) {
+        Ok(pair) => {
+            println!("maic-desktop: serving {}", pair.0);
+            pair
+        }
+        Err(msg) => return boot_failed(app, &msg),
+    };
+    app.manage(ServerChild(Mutex::new(Some(child))));
+    let parsed: tauri::Url = match url.parse().map_err(|e| format!("invalid server url: {e}")) {
+        Ok(u) => u,
+        Err(msg) => return boot_failed(app, &msg),
+    };
+    if let Some(splash) = app.get_webview_window("splash") {
+        let _ = splash.close();
+    }
+    if let Err(e) = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(parsed))
+        .title("MAIC Desktop")
+        .inner_size(1280.0, 800.0)
+        .build()
+    {
+        boot_failed(app, &format!("failed to create main window: {e}"));
+    }
+}
+
+/// Push a status line to the splash window (best effort).
+fn splash_status(app: &tauri::AppHandle, text: &str) {
+    if let Some(splash) = app.get_webview_window("splash") {
+        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = splash.eval(format!(
+            "window.__maicStatus && window.__maicStatus(\"{escaped}\")"
+        ));
+    }
+}
+
+/// Show the fatal error inside the splash window instead of exiting blindly.
+/// The message includes the captured server log tail when available.
+fn boot_failed(app: &tauri::AppHandle, message: &str) {
+    eprintln!("maic-desktop fatal: {message}");
+    if let Some(splash) = app.get_webview_window("splash") {
+        // Order matters: show the message first, then the dialog — the user
+        // lands on a window that explains the failure either way.
+        let escaped = message
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let _ = splash.eval(format!(
+            "window.__maicFatal && window.__maicFatal(\"{escaped}\")"
+        ));
+        let _ = app
+            .dialog()
+            .message(message.to_string())
+            .title("MAIC Desktop")
+            .kind(MessageDialogKind::Error)
+            .blocking_show();
+        return;
+    }
+    fatal(app, message);
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // Bundled build marker (also used to version the staged sidecar copy).
-            let tarball = app
-                .path()
-                .resolve("resources/server.tar.gz", BaseDirectory::Resource)
-                .map(|t| read_bundled_meta(&t).unwrap_or_else(|_| "{}".to_string()))
-                .unwrap_or_else(|_| "{}".to_string());
-            let server_dir = match ensure_server(app.handle()) {
-                Ok(dir) => dir,
-                Err(msg) => fatal(app.handle(), &msg),
-            };
-            let node_bin = match ensure_sidecar(app.handle(), &tarball) {
-                Ok(bin) => bin,
-                Err(msg) => fatal(app.handle(), &msg),
-            };
-            let (url, child) = match start_server(app.handle(), &server_dir, &node_bin) {
-                Ok(pair) => {
-                    println!("maic-desktop: serving {}", pair.0);
-                    pair
+            // Show a splash window immediately: first launch extracts ~200 MB
+            // and restores ~300 links before the server can answer, which used
+            // to look like a dead launch (no window for a minute or more).
+            // Heavy work runs on a worker thread; the splash navigates to the
+            // server once /api/health is green, or shows the fatal error.
+            //
+            // The page is compiled in and injected as an initialization
+            // script: it runs synchronously at document creation, so there is
+            // no eval-timing race (eval right after build may be dropped while
+            // about:blank isn't ready, which produced the blank window).
+            // WebviewUrl::App is avoided: in `tauri dev` it resolves to the
+            // dev server (404) and asset-protocol quirks differ per OS.
+            const SPLASH_HTML: &str = include_str!("../frontend-dist/splash.html");
+            // initialization_script takes plain JS: document.write the page.
+            // Escape for a JS string literal.
+            let mut init_js = String::with_capacity(SPLASH_HTML.len() + 64);
+            init_js.push_str("document.open();document.write(\"");
+            for c in SPLASH_HTML.chars() {
+                match c {
+                    '"' => init_js.push_str("\\\""),
+                    '\\' => init_js.push_str("\\\\"),
+                    '\n' => init_js.push_str("\\n"),
+                    '\r' => {}
+                    _ => init_js.push(c),
                 }
-                Err(msg) => fatal(app.handle(), &msg),
-            };
-            app.manage(ServerChild(Mutex::new(Some(child))));
+            }
+            init_js.push_str("\");document.close();");
             WebviewWindowBuilder::new(
                 app,
-                "main",
+                "splash",
                 WebviewUrl::External(
-                    url.parse()
-                        .map_err(|e| format!("invalid server url: {e}"))?,
+                    "about:blank"
+                        .parse()
+                        .map_err(|e| format!("bad blank url: {e}"))?,
                 ),
             )
             .title("MAIC Desktop")
-            .inner_size(1280.0, 800.0)
+            .inner_size(420.0, 300.0)
+            .center()
+            .resizable(false)
+            .decorations(false)
+            .visible(true)
+            // Native window background before the webview paints its first
+            // frame (covers the white flash, esp. on WebView2).
+            .background_color(tauri::window::Color(0, 0, 0, 255))
+            .initialization_script(&init_js)
             .build()?;
+
+            let handle = app.handle().clone();
+            std::thread::spawn(move || boot_in_background(&handle));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -897,5 +1159,65 @@ mod log_tail_tests {
         let out = format_log_tail("Error: boom\n");
         assert!(out.contains("Server output:"));
         assert!(out.contains("Error: boom"));
+    }
+}
+
+#[cfg(test)]
+mod verify_tree_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn verify_passes_on_complete_tree() {
+        let dir = std::env::temp_dir().join(format!("maic-verify-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // next/ must resolve with dist/server; helpers reachable by walking up
+        // from the canonical next dir into .pnpm store is complex in tmp, so
+        // place helpers where the walk finds it: node_modules/@swc/helpers at root.
+        fs::write(dir.join("server.js"), "x").unwrap();
+        let next = dir.join("node_modules").join("next");
+        fs::create_dir_all(next.join("dist").join("server")).unwrap();
+        let helpers = dir.join("node_modules").join("@swc").join("helpers");
+        fs::create_dir_all(helpers.join("cjs")).unwrap();
+        fs::write(
+            helpers.join("package.json"),
+            r#"{"exports": {"./_/_interop_require_default": {"default": "./cjs/x.cjs"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            helpers.join("cjs").join("_interop_require_default.cjs"),
+            "c",
+        )
+        .unwrap();
+        assert!(verify_server_tree(&dir).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_fails_without_next() {
+        let dir = std::env::temp_dir().join(format!("maic-verify-no-next-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("server.js"), "x").unwrap();
+        let err = verify_server_tree(&dir).unwrap_err();
+        assert!(err.contains("next"), "bad error: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_fails_without_helpers_files() {
+        let dir = std::env::temp_dir().join(format!("maic-verify-no-hlp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("server.js"), "x").unwrap();
+        let next = dir.join("node_modules").join("next");
+        fs::create_dir_all(next.join("dist").join("server")).unwrap();
+        let helpers = dir.join("node_modules").join("@swc").join("helpers");
+        fs::create_dir_all(&helpers).unwrap();
+        fs::write(helpers.join("package.json"), r#"{"exports": {}}"#).unwrap();
+        let err = verify_server_tree(&dir).unwrap_err();
+        assert!(err.contains("@swc/helpers"), "bad error: {err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
