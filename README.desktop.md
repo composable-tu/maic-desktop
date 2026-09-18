@@ -83,7 +83,7 @@ of the Dock (verified with `lsappinfo list`).
 `cp -R src-tauri/resources/server src-tauri/target/debug/resources/`.
 
 ## CI
-
+ 
 - `desktop-check.yml` (PR / push to main touching wrapper files): submodule build +
   `cargo check` + `tauri build --no-bundle` smoke on Ubuntu.
 - `desktop-build.yml` (push to main, `desktop-v*` tags, manual dispatch): full bundles on
