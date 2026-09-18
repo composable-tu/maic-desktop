@@ -66,10 +66,13 @@ Windows note: the stock tar backend (bsdtar) mangles symlink entries into
 `\\?\C:\…` paths and aborts extraction with "Invalid argument" (previously
 misdiagnosed as silently dropped links). `prepare-server` therefore strips all
 294 symlinks before packing — the tarball ships zero links — and writes a
-`server/.links.json` manifest; on first launch the shell restores directory links
-as NTFS junctions (`mklink /J`, no privileges required — unlike symlinks, which
-need Developer Mode) and materializes file links as plain copies. Other platforms
-restore the same manifest as symlinks, so behavior is identical everywhere.
+`server/.links.json` manifest; on first launch the shell restores directory
+links as **real directory copies** on Windows (junctions proved unreliable
+under Node's module walk: the nested `@swc/helpers` junction was unusable to
+Node while every `fs::canonicalize`-based check passed, surfacing as
+`Cannot find module '@swc/helpers/…'`) and file links as plain copies. Other
+platforms restore the same manifest as symlinks, so behavior is identical
+everywhere.
 
 macOS Dock note: the Node sidecar binary is copied out of the `.app` bundle into
 `app-data/bin/` before launch, and is re-signed ad-hoc at stage time. Without this,

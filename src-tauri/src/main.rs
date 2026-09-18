@@ -266,11 +266,18 @@ fn extract_tarball(tarball: &std::path::Path, dest: &std::path::Path) -> Result<
 /// Background: the tarball ships zero symlinks (Windows bsdtar mangles them
 /// into \\?\C:\… paths and aborts extraction with "Invalid argument"), so
 /// every link in the pnpm isolated-deps layout must be recreated at launch.
-/// On Windows, directory links become NTFS junctions (`mklink /J`, no
-/// privileges required — unlike symlinks, which need Developer Mode) and
-/// file links are materialized as copies; on unix both become symlinks.
-/// Node resolves junctions the same way, so all platforms behave alike.
-/// All manifest links point inside the server tree; anything else is refused.
+/// On Windows, directory links become NTFS junctions and file links are
+/// materialized as plain copies; on unix both become symlinks. All manifest
+/// links point inside the server tree; anything else is refused.
+///
+/// Shadow replacement: if a manifest link path is occupied by a REAL
+/// file/dir (not a link), it is replaced. Windows-built bundles carry these:
+/// `fs.cp` materializes the standalone tree's junctions into partial real
+/// dirs (e.g. node_modules/next holding dist/ but nothing else), which then
+/// SHADOW the pnpm store copy — Node loads modules from the shadow and its
+/// module walk never reaches the store's @swc/helpers, dying with
+/// MODULE_NOT_FOUND. Replacing the shadow with the manifest-defined link
+/// restores the physical store layout Node needs.
 fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
     let manifest_path = server_dir.join(".links.json");
     let text = std::fs::read_to_string(&manifest_path)
@@ -292,9 +299,52 @@ fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
     for (link_rel, target_rel) in links {
         let link = join_rel(server_dir, &link_rel)?;
         let target = join_rel(server_dir, &target_rel)?;
-        // The entry may already exist (older tarball, dev tree) — skip those.
-        if link.exists() || std::fs::symlink_metadata(&link).is_ok() {
+        let meta = match std::fs::symlink_metadata(&link) {
+            Ok(m) => m,
+            Err(_) => {
+                // Absent: the normal path, create it below.
+                if let Some(parent) = link.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+                }
+                match link_plan(&link, &target)? {
+                    LinkAction::Junction => {
+                        create_dir_link(&link, &target)?;
+                        restored += 1;
+                    }
+                    LinkAction::CopyFile => {
+                        std::fs::copy(&target, &link).map_err(|e| {
+                            format!(
+                                "failed to materialize {} from {}: {e}",
+                                link.display(),
+                                target.display()
+                            )
+                        })?;
+                        copied += 1;
+                    }
+                }
+                continue;
+            }
+        };
+        if meta.is_symlink() || meta.file_type().is_symlink() {
+            // Already a link (dev tree, previous restore) — keep it.
             continue;
+        }
+        // A REAL file/dir occupies a manifest link path. Windows-built
+        // bundles carry these: `fs.cp` materializes the standalone tree's
+        // junctions into partial real dirs (e.g. node_modules/next holding
+        // dist/ but nothing else), which then SHADOW the pnpm store copy —
+        // Node loads constants.js from the shadow and its module walk never
+        // reaches the store's @swc/helpers, dying with MODULE_NOT_FOUND
+        // exactly as reported. Replace the shadow with the manifest-defined
+        // link (full copy/junction to the store) so resolution goes through
+        // the real pnpm layout.
+        if meta.is_dir() {
+            std::fs::remove_dir_all(&link)
+                .map_err(|e| format!("failed to clear shadow dir {}: {e}", link.display()))?;
+        } else {
+            std::fs::remove_file(&link)
+                .map_err(|e| format!("failed to clear shadow file {}: {e}", link.display()))?;
         }
         if let Some(parent) = link.parent() {
             std::fs::create_dir_all(parent)
@@ -458,8 +508,17 @@ fn node_can_resolve(
 }
 
 /// Create a directory link: junction on Windows, symlink on unix.
+///
+/// A real directory COPY is NOT a valid substitute: pnpm's isolated layout
+/// requires `next` to live physically inside `.pnpm/next@…/node_modules/`
+/// next to its own deps, and Node's resolution walks the PHYSICAL parent
+/// chain. A copy at the link path resolves its own deps from the wrong
+/// ancestors and dies with MODULE_NOT_FOUND (verified locally). Junctions
+/// (like unix symlinks) keep the physical path inside the store, which is
+/// what makes resolution work.
+///
 /// Junctions use an absolute target so they survive regardless of the
-/// process working directory.
+/// process working directory. `mklink /J` needs no privileges.
 #[cfg(windows)]
 fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
     let mut cmd = Command::new("cmd");
@@ -482,7 +541,7 @@ fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> Result<(
     Ok(())
 }
 
-/// Create a directory link: junction on Windows, symlink on unix.
+/// Create a directory link: symlink on unix.
 #[cfg(not(windows))]
 fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
     std::os::unix::fs::symlink(target, link).map_err(|e| {
@@ -498,7 +557,7 @@ fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> Result<(
 /// How a manifest link should be restored on disk.
 #[derive(Debug, PartialEq, Eq)]
 enum LinkAction {
-    /// Target is a directory: create a junction.
+    /// Target is a directory: junction on Windows, symlink on unix.
     Junction,
     /// Target is a file: copy its bytes.
     CopyFile,

@@ -76,7 +76,13 @@ async function pathExists(p) {
 
 async function copyDir(src, dest) {
   await fs.mkdir(dest, { recursive: true });
-  await fs.cp(src, dest, { recursive: true });
+  // verbatimSymlinks:false would dereference junctions/symlinks into REAL
+  // dirs — fatal on Windows, where pnpm uses junctions: the staged tree
+  // would carry a partial real copy of e.g. node_modules/next that shadows
+  // the store, and Node's module walk would then miss @swc/helpers
+  // (MODULE_NOT_FOUND at runtime). dereference:false keeps the link itself
+  // (as a junction on Windows) so link detection below sees it.
+  await fs.cp(src, dest, { recursive: true, dereference: false });
 }
 
 // Standalone staging copy. Next's standalone output mirrors pnpm's symlinked
@@ -87,18 +93,24 @@ async function copyDir(src, dest) {
 // pointing back at the build machine's source tree would dangle on the user's
 // machine. Rewrite them as tree-relative links into the staged copy:
 //   <standaloneDir>/…  ->  <resourcesDir>/…
-// Collect every symlink under dir as { link, target } pairs, both expressed
-// with POSIX separators relative to dir. Written to server/.links.json so the
-// desktop shell can restore links on platforms where the tarball transport
-// cannot carry them (Windows bsdtar drops them; directory junctions created
-// with `mklink /J` need no privileges, unlike symlinks).
+// Collect every symlink/junction under dir as { link, target } pairs, both
+// expressed with POSIX separators relative to dir. Written to
+// server/.links.json so the desktop shell can restore links on platforms
+// where the tarball transport cannot carry them (Windows bsdtar drops them;
+// the shell recreates them as junctions). readdir's withFileTypes may report
+// junctions as plain directories, so each directory entry is double-checked
+// with lstat.
 async function collectLinks(dir) {
   const out = [];
   async function walk(cur) {
     const entries = await fs.readdir(cur, { withFileTypes: true });
     for (const e of entries) {
       const p = path.join(cur, e.name);
-      if (e.isSymbolicLink()) {
+      let isLink = e.isSymbolicLink();
+      if (!isLink && e.isDirectory()) {
+        isLink = (await fs.lstat(p)).isSymbolicLink();
+      }
+      if (isLink) {
         const raw = await fs.readlink(p);
         const abs = path.resolve(path.dirname(p), raw);
         let relTarget;
@@ -146,7 +158,12 @@ async function materializeExternalLinks(stagedDir) {
     const entries = await fs.readdir(cur, { withFileTypes: true });
     for (const e of entries) {
       const p = path.join(cur, e.name);
-      if (e.isSymbolicLink()) {
+      // Junctions can surface as plain directories in withFileTypes.
+      let isLink = e.isSymbolicLink();
+      if (!isLink && e.isDirectory()) {
+        isLink = (await fs.lstat(p)).isSymbolicLink();
+      }
+      if (isLink) {
         const raw = await fs.readlink(p);
         const abs = path.resolve(path.dirname(p), raw);
         if (abs === stagedDir || abs.startsWith(stagedDir + path.sep)) {
@@ -173,10 +190,12 @@ async function materializeExternalLinks(stagedDir) {
   console.log(`materialized ${count} external links into the staged tree`);
 }
 
-// Delete every symlink under dir (files stay). Used before packing the
-// tarball: Windows bsdtar cannot extract symlink entries (it mangles them
-// into \\?\C:\… paths and aborts with "Invalid argument"). The removed
-// links are fully described by .links.json and restored at launch.
+// Delete every symlink (and junction) under dir (files stay). Used before
+// packing the tarball: Windows bsdtar cannot extract symlink entries (it
+// mangles them into \\?\C:\… paths and aborts with "Invalid argument"). The
+// removed links are fully described by .links.json and restored at launch.
+// readdir's withFileTypes may report junctions as plain directories on some
+// Node/libuv combos, so each directory entry is double-checked with lstat.
 async function stripLinks(dir) {
   let count = 0;
   async function walk(cur) {
@@ -187,12 +206,21 @@ async function stripLinks(dir) {
         await fs.rm(p);
         count++;
       } else if (e.isDirectory()) {
-        await walk(p);
+        // Junctions can surface as plain directories in withFileTypes;
+        // lstat is authoritative (isSymbolicLink covers both links and
+        // junctions on Windows).
+        const st = await fs.lstat(p);
+        if (st.isSymbolicLink()) {
+          await fs.rm(p);
+          count++;
+        } else {
+          await walk(p);
+        }
       }
     }
   }
   await walk(dir);
-  console.log(`stripped ${count} symlinks before packing`);
+  console.log(`stripped ${count} symlinks/junctions before packing`);
 }
 
 async function relinkStagedTree(standaloneDir, resourcesDir) {
@@ -200,7 +228,13 @@ async function relinkStagedTree(standaloneDir, resourcesDir) {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const e of entries) {
       const p = path.join(dir, e.name);
-      if (e.isSymbolicLink()) {
+      // Junctions (Windows pnpm layout) can surface as plain directories in
+      // withFileTypes — double-check with lstat so every link is rewritten.
+      let isLink = e.isSymbolicLink();
+      if (!isLink && e.isDirectory()) {
+        isLink = (await fs.lstat(p)).isSymbolicLink();
+      }
+      if (isLink) {
         const raw = await fs.readlink(p);
         const abs = path.resolve(path.dirname(p), raw);
         if (abs === standaloneDir || abs.startsWith(standaloneDir + path.sep)) {
@@ -209,7 +243,17 @@ async function relinkStagedTree(standaloneDir, resourcesDir) {
             path.join(resourcesDir, path.relative(standaloneDir, abs)),
           );
           await fs.rm(p);
-          await fs.symlink(rel, p);
+          // pnpm's layout relies on links resolving INSIDE the tree. On
+          // Windows a relative dir symlink needs privileges; a junction
+          // (absolute target) is the no-privilege equivalent and is what
+          // pnpm itself uses.
+          if (process.platform === 'win32') {
+            const absTarget = path.resolve(path.dirname(p), rel);
+            await fs.rm(p, { force: true, recursive: true });
+            await fs.symlink(absTarget, p, 'junction');
+          } else {
+            await fs.symlink(rel, p);
+          }
           // The rewritten target may itself be stale (e.g. pnpm's has-flag
           // ghost entry): drop it if nothing exists there.
           try {
