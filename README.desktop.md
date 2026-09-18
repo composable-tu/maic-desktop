@@ -44,15 +44,24 @@ be statically exported. Instead the desktop app ships the Next.js **standalone s
   Supported: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
   `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`,
   `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`.
-- `--skip-build`: reuse the existing `.next/` output.
+- `--skip-build`: reuse the existing `.next/` output. Requires the submodule's
+  current `node_modules` to already be hoisted (see the note below), otherwise
+  staging refuses to pack an isolated-layout tree.
 - `--skip-node`: stage the server without (re)downloading Node.
+
+The submodule is installed with **`--config.node-linker=hoisted`** (npm-style
+flat `node_modules`, no `.pnpm` symlink farm) purely for this staging step — the
+wrapper never edits anything inside `openmaic-src/`. That is what makes the
+bundle portable: the shipped tree contains **zero symlinks/junctions**, so
+nothing has to survive the trip through an installer.
 
 Staged payload (all gitignored, generated at build time):
 
 - `src-tauri/resources/server/` — unpacked standalone tree (kept on disk for `tauri dev`)
-- `src-tauri/resources/server.tar.gz` (~200 MB) — the same tree as a tarball; this is
-  what ships inside the installer. A tarball is required because app bundlers do not
-  preserve symlinks, and pnpm's isolated-deps layout depends on them.
+- `src-tauri/resources/server.tar.gz` (~220 MB) — the same tree as a tarball; this is
+  what ships inside the installer. The tree is a plain directory snapshot, so the
+  archive carries no link entries; the tarball is kept because bundling ~30 k small
+  files is far slower than bundling one.
 - `src-tauri/binaries/openmaic-node-<triple>[.exe]` — official Node 22 LTS binary,
   exact version pinned in `.build-meta.json` (follows latest 22-LTS at build time).
 
@@ -62,17 +71,19 @@ At runtime, the app extracts the tarball to the OS app-data dir on first launch
 system `tar` (preinstalled on macOS, mainstream Linux, and Windows 10+), and
 extraction failures now surface tar's own stderr instead of a bare exit code.
 
-Windows note: the stock tar backend (bsdtar) mangles symlink entries into
-`\\?\C:\…` paths and aborts extraction with "Invalid argument" (previously
-misdiagnosed as silently dropped links). `prepare-server` therefore strips all
-294 symlinks before packing — the tarball ships zero links — and writes a
-`server/.links.json` manifest; on first launch the shell restores directory
-links as **real directory copies** on Windows (junctions proved unreliable
-under Node's module walk: the nested `@swc/helpers` junction was unusable to
-Node while every `fs::canonicalize`-based check passed, surfacing as
-`Cannot find module '@swc/helpers/…'`) and file links as plain copies. Other
-platforms restore the same manifest as symlinks, so behavior is identical
-everywhere.
+Windows note: the server tree used to be pnpm's isolated layout, whose 294
+symlinks cannot be transported through an installer (bsdtar mangles symlink
+entries into `\\?\C:\…` paths and aborts with "Invalid argument"). Restoring
+them at launch failed too — as junctions, Node's module walk could not use the
+nested `@swc/helpers` link while every `fs::canonicalize`-based check passed;
+and `fs.cp` on a Windows build host silently *materialized* the outer links into
+partial real dirs, so those paths never even reached the restore manifest. Both
+surfaced as `Cannot find module '@swc/helpers/_/_interop_require_default'` on
+launch while the macOS build worked. Shipping a hoisted, link-free tree removes
+the whole failure class — and drops the long `.pnpm/<name>@<ver>_<peer-hash>`
+path segments that pushed Windows toward the 260-character limit. Do not
+re-introduce symlinks into the staged tree: `prepare-server` asserts zero links
+before packing, and the shell no longer has any link-restore code.
 
 macOS Dock note: the Node sidecar binary is copied out of the `.app` bundle into
 `app-data/bin/` before launch, and is re-signed ad-hoc at stage time. Without this,
@@ -90,7 +101,10 @@ of the Dock (verified with `lsappinfo list`).
 - `desktop-check.yml` (PR / push to main touching wrapper files): submodule build +
   `cargo check` + `tauri build --no-bundle` smoke on Ubuntu.
 - `desktop-build.yml` (push to main, `desktop-v*` tags, manual dispatch): full bundles on
-  4 runners — mac-arm64, mac-x64, win-x64, win-arm64. Uploads `.dmg` (mac) /
+  4 runners — mac-arm64, mac-x64, win-x64, win-arm64. Every job is gated on
+  `prepare-server`'s smoke boot, which extracts the finished `server.tar.gz` and
+  waits for `/api/health` from it on that job's own OS — the check that would
+  have caught the broken Windows bundle before it shipped. Uploads `.dmg` (mac) /
   nsis+msi (win) to **Actions Artifacts, 90-day retention**. No GitHub Releases are created;
   `desktop-v*` tags are build triggers only.
 - macOS builds are **unsigned** for now: first launch needs right-click → Open.

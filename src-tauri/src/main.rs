@@ -4,8 +4,9 @@
 //  1. `setup` (main thread) shows the splash window immediately, then spawns
 //     a worker thread for the heavy work below.
 //  2. Worker: ensure the bundled server tree is extracted to the app data dir
-//     (shipped as server.tar.gz because bundlers don't preserve symlinks;
-//     skipped when the staged .build-meta.json already matches).
+//     (shipped as server.tar.gz — a plain directory snapshot; it carries no
+//     symlinks, so extraction needs no post-processing). Skipped when the
+//     staged .build-meta.json already matches.
 //  3. Pick a free loopback port from the OS.
 //  4. Spawn the bundled Node sidecar running the Next.js standalone server
 //     with PORT/HOSTNAME pointed at it.
@@ -140,10 +141,6 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
                 "maic-desktop: using dev server tree at {}",
                 dev_dir.display()
             );
-            // The staged tree ships zero symlinks (stripped before packing),
-            // so the dev tree needs the same link restore as an extraction.
-            // Idempotent: existing entries are skipped.
-            restore_links(&dev_dir)?;
             verify_server_tree(&dev_dir)?;
             return Ok(dev_dir);
         }
@@ -174,14 +171,11 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         stage_fresh_server(&tarball, &data_dir, &server_dir, &staged_meta)?;
     } else {
         println!("maic-desktop: reusing extracted server runtime");
-        // A reused tree is not necessarily healthy: links can go missing
-        // after staging (cleaner tools, AV quarantine, a crash mid-restore)
-        // while the marker still matches. Top up links and re-verify on
-        // every launch — cheap (~300 stats) — and re-extract once when
-        // broken instead of crash-looping the server 5 times. (This is the
-        // Windows "@swc/helpers MODULE_NOT_FOUND": the marker matched, so
-        // the damaged tree was trusted blindly.)
-        if let Err(e) = restore_links(&server_dir).and_then(|_| verify_server_tree(&server_dir)) {
+        // A reused tree is not necessarily healthy: files can go missing after
+        // staging (cleaner tools, AV quarantine, a crash mid-extraction) while
+        // the marker still matches. Re-verify on every launch — cheap — and
+        // re-extract once when broken instead of crash-looping the server.
+        if let Err(e) = verify_server_tree(&server_dir) {
             eprintln!("maic-desktop: staged server failed validation ({e}); re-extracting");
             stage_fresh_server(&tarball, &data_dir, &server_dir, &staged_meta)?;
         }
@@ -189,10 +183,9 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(server_dir)
 }
 
-/// Extract the tarball and stage a fresh server tree: unpack, restore the
-/// pnpm link layout (the tarball ships zero symlinks), verify it can boot,
-/// then record the marker. Used for first launch, updates, and one-shot
-/// repair of a damaged staged tree.
+/// Extract the tarball and stage a fresh server tree, then verify it can boot
+/// and record the marker. Used for first launch, updates, and one-shot repair
+/// of a damaged staged tree.
 fn stage_fresh_server(
     tarball: &std::path::Path,
     data_dir: &std::path::Path,
@@ -202,9 +195,8 @@ fn stage_fresh_server(
     println!("maic-desktop: extracting server runtime (first launch or update)…");
     std::fs::create_dir_all(data_dir).map_err(|e| format!("failed to create app data dir: {e}"))?;
     // Remove any previous tree so stale files can't shadow the new build.
-    // Fail loudly here: extracting over a half-removed tree (e.g. locked
-    // junctions on Windows) produces a corrupt server that dies later
-    // with a confusing module error.
+    // Fail loudly here: extracting over a half-removed tree produces a corrupt
+    // server that dies later with a confusing module error.
     if server_dir.exists() {
         std::fs::remove_dir_all(server_dir).map_err(|e| {
             format!(
@@ -214,8 +206,6 @@ fn stage_fresh_server(
         })?;
     }
     extract_tarball(tarball, data_dir)?;
-    // Recreate the pnpm symlink layout (the tarball carries none).
-    restore_links(server_dir)?;
     // Fail fast with a precise message instead of a deep MODULE_NOT_FOUND.
     verify_server_tree(server_dir)?;
     std::fs::write(data_dir.join(".build-meta.json"), staged_meta)
@@ -262,123 +252,11 @@ fn extract_tarball(tarball: &std::path::Path, dest: &std::path::Path) -> Result<
     Ok(())
 }
 
-/// Restore symlinks from the server/.links.json manifest.
-///
-/// Background: the tarball ships zero symlinks (Windows bsdtar mangles them
-/// into \\?\C:\… paths and aborts extraction with "Invalid argument"), so
-/// every link in the pnpm isolated-deps layout must be recreated at launch.
-/// On Windows, directory links become NTFS junctions and file links are
-/// materialized as plain copies; on unix both become symlinks. All manifest
-/// links point inside the server tree; anything else is refused.
-///
-/// Shadow replacement: if a manifest link path is occupied by a REAL
-/// file/dir (not a link), it is replaced. Windows-built bundles carry these:
-/// `fs.cp` materializes the standalone tree's junctions into partial real
-/// dirs (e.g. node_modules/next holding dist/ but nothing else), which then
-/// SHADOW the pnpm store copy — Node loads modules from the shadow and its
-/// module walk never reaches the store's @swc/helpers, dying with
-/// MODULE_NOT_FOUND. Replacing the shadow with the manifest-defined link
-/// restores the physical store layout Node needs.
-fn restore_links(server_dir: &std::path::Path) -> Result<(), String> {
-    let manifest_path = server_dir.join(".links.json");
-    let text = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("link manifest missing at {}: {e}", manifest_path.display()))?;
-    let mut links = parse_links_manifest(&text)?;
-    // Restore deepest store paths first: pnpm's layout nests links inside
-    // store dirs (e.g. .../next@.../node_modules/@swc/helpers), and a parent
-    // restored before its target's parent can shadow resolution on Windows.
-    // Sorting by link depth (deepest first) approximates topological order for
-    // this flat store layout without a full dependency graph.
-    links.sort_by(|a, b| {
-        b.0.matches('/')
-            .count()
-            .cmp(&a.0.matches('/').count())
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    let mut restored = 0u32;
-    let mut copied = 0u32;
-    for (link_rel, target_rel) in links {
-        let link = join_rel(server_dir, &link_rel)?;
-        let target = join_rel(server_dir, &target_rel)?;
-        let meta = match std::fs::symlink_metadata(&link) {
-            Ok(m) => m,
-            Err(_) => {
-                // Absent: the normal path, create it below.
-                if let Some(parent) = link.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-                }
-                match link_plan(&link, &target)? {
-                    LinkAction::Junction => {
-                        create_dir_link(&link, &target)?;
-                        restored += 1;
-                    }
-                    LinkAction::CopyFile => {
-                        std::fs::copy(&target, &link).map_err(|e| {
-                            format!(
-                                "failed to materialize {} from {}: {e}",
-                                link.display(),
-                                target.display()
-                            )
-                        })?;
-                        copied += 1;
-                    }
-                }
-                continue;
-            }
-        };
-        if meta.is_symlink() || meta.file_type().is_symlink() {
-            // Already a link (dev tree, previous restore) — keep it.
-            continue;
-        }
-        // A REAL file/dir occupies a manifest link path. Windows-built
-        // bundles carry these: `fs.cp` materializes the standalone tree's
-        // junctions into partial real dirs (e.g. node_modules/next holding
-        // dist/ but nothing else), which then SHADOW the pnpm store copy —
-        // Node loads constants.js from the shadow and its module walk never
-        // reaches the store's @swc/helpers, dying with MODULE_NOT_FOUND
-        // exactly as reported. Replace the shadow with the manifest-defined
-        // link (full copy/junction to the store) so resolution goes through
-        // the real pnpm layout.
-        if meta.is_dir() {
-            std::fs::remove_dir_all(&link)
-                .map_err(|e| format!("failed to clear shadow dir {}: {e}", link.display()))?;
-        } else {
-            std::fs::remove_file(&link)
-                .map_err(|e| format!("failed to clear shadow file {}: {e}", link.display()))?;
-        }
-        if let Some(parent) = link.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-        }
-        match link_plan(&link, &target)? {
-            LinkAction::Junction => {
-                create_dir_link(&link, &target)?;
-                restored += 1;
-            }
-            LinkAction::CopyFile => {
-                std::fs::copy(&target, &link).map_err(|e| {
-                    format!(
-                        "failed to materialize {} from {}: {e}",
-                        link.display(),
-                        target.display()
-                    )
-                })?;
-                copied += 1;
-            }
-        }
-    }
-    println!("maic-desktop: restored {restored} dir links, materialized {copied} files");
-    Ok(())
-}
-
-/// Verify the server tree can actually boot Node resolution before spawning.
-/// Checks the exact chain Next.js standalone relies on: `server.js` exists,
-/// `node_modules/next` resolves (junction/symlink or dir) into a tree holding
-/// `dist/`, and `@swc/helpers` resolves with its `exports` map plus the
-/// runtime helper files Node ≥22 selects (`esm/` via module-sync, `cjs/` via
-/// default). Without this, a missing junction surfaces pages later as a bare
-/// `Cannot find module '@swc/helpers/_/...'` with no hint which link broke.
+/// Verify the server tree is bootable before spawning: `server.js` exists, the
+/// `next` package carries `dist/`, and `@swc/helpers` is reachable the way Node
+/// reaches it — by walking up from `next`'s own directory. Without this, a
+/// pruned extraction surfaces much later as a bare
+/// `Cannot find module '@swc/helpers/_/...'` with no hint what is missing.
 fn verify_server_tree(server_dir: &std::path::Path) -> Result<(), String> {
     let server_js = server_dir.join("server.js");
     if !server_js.is_file() {
@@ -388,66 +266,44 @@ fn verify_server_tree(server_dir: &std::path::Path) -> Result<(), String> {
         ));
     }
     let next_dir = server_dir.join("node_modules").join("next");
-    // Resolve through junction/symlink: metadata follows links.
-    let next_real = std::fs::metadata(&next_dir).map_err(|_| {
+    if !next_dir.is_dir() {
+        return Err(format!(
+            "server tree incomplete: {} missing (extraction incomplete?)",
+            next_dir.display()
+        ));
+    }
+    if !next_dir.join("dist").join("server").is_dir() {
+        return Err(format!(
+            "server tree incomplete: next dist missing under {}",
+            next_dir.display()
+        ));
+    }
+    // Deliberately no fallback here: an earlier version also accepted a
+    // `@swc/helpers` reached through pnpm's `.pnpm/node_modules` hoist bridge,
+    // which let a tree where `next` itself could not resolve its helpers pass
+    // verification — precisely the broken bundle that shipped as the Windows
+    // MODULE_NOT_FOUND crash.
+    let mut helpers_dir = None;
+    let mut cur = Some(next_dir.as_path());
+    while let Some(dir) = cur {
+        let cand = dir.join("node_modules").join("@swc").join("helpers");
+        if cand.is_dir() {
+            helpers_dir = Some(cand);
+            break;
+        }
+        cur = dir.parent();
+    }
+    let helpers_dir = helpers_dir.ok_or_else(|| {
         format!(
-            "server tree incomplete: {} missing or unrestored (pnpm junction for `next` not recreated — check .links.json restore)",
+            "server tree incomplete: @swc/helpers not resolvable by walking up from {} (Node would die with MODULE_NOT_FOUND)",
             next_dir.display()
         )
     })?;
-    if !next_real.is_dir() {
-        return Err(format!(
-            "server tree incomplete: {} is not a directory",
-            next_dir.display()
-        ));
-    }
-    // Canonicalize to the real location for the remaining probes so nested
-    // junctions (e.g. .../next@.../node_modules/@swc/helpers) are followed.
-    let next_canon = std::fs::canonicalize(&next_dir)
-        .map_err(|e| format!("cannot resolve {}: {e}", next_dir.display()))?;
-    if !next_canon.join("dist").join("server").is_dir() {
-        return Err(format!(
-            "server tree incomplete: next dist missing under {}",
-            next_canon.display()
-        ));
-    }
-    // Walk up from the real next/ dir like Node does, looking for a usable
-    // @swc/helpers package (exports map + at least one runtime helper file).
-    let mut anchor: Option<&std::path::Path> = None;
-    let mut cur = next_canon.as_path();
-    loop {
-        let cand = cur.join("node_modules").join("@swc").join("helpers");
-        if let Ok(md) = std::fs::metadata(&cand) {
-            if md.is_dir() {
-                anchor = Some(cur);
-                break;
-            }
-        }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => break,
-        }
-    }
-    // Fall back to the pnpm hoisted bridge used when present.
-    let bridge = server_dir
-        .join("node_modules")
-        .join(".pnpm")
-        .join("node_modules")
-        .join("@swc")
-        .join("helpers");
-    let helpers_dir = match anchor {
-        Some(a) => a.join("node_modules").join("@swc").join("helpers"),
-        None => bridge.clone(),
-    };
     let pkg_path = helpers_dir.join("package.json");
     let pkg_text = std::fs::read_to_string(&pkg_path).map_err(|_| {
         format!(
-            "server tree incomplete: @swc/helpers unresolvable from {} (junction chain broken — expected via {} or hoisted {})",
-            next_canon.display(),
-            anchor
-                .map(|a| a.join("node_modules").join("@swc").join("helpers").display().to_string())
-                .unwrap_or_else(|| "<none>".to_string()),
-            bridge.display(),
+            "server tree incomplete: {} has no readable package.json",
+            helpers_dir.display()
         )
     })?;
     if !pkg_text.contains("\"./_/_interop_require_default\"") {
@@ -456,252 +312,15 @@ fn verify_server_tree(server_dir: &std::path::Path) -> Result<(), String> {
             pkg_path.display()
         ));
     }
-    // Canonicalize again: helpers_dir itself may be a junction.
-    let helpers_canon = std::fs::canonicalize(&helpers_dir)
-        .map_err(|e| format!("cannot resolve {}: {e}", helpers_dir.display()))?;
-    let esm = helpers_canon
-        .join("esm")
-        .join("_interop_require_default.js");
-    let cjs = helpers_canon
-        .join("cjs")
-        .join("_interop_require_default.cjs");
+    let esm = helpers_dir.join("esm").join("_interop_require_default.js");
+    let cjs = helpers_dir.join("cjs").join("_interop_require_default.cjs");
     if !esm.is_file() && !cjs.is_file() {
         return Err(format!(
             "@swc/helpers runtime files missing under {} (need esm/_interop_require_default.js or cjs/_interop_require_default.cjs — Next standalone tracing may have pruned them)",
-            helpers_canon.display()
+            helpers_dir.display()
         ));
     }
     Ok(())
-}
-
-/// Resolve a module the way Node would from a given anchor path, using the
-/// actual Node binary. Kept for manual diagnostics: the behavioral probe
-/// (running the real server and reading its log) proved more reliable than
-/// static or resolver-level checks, because Next's require-hook aliases
-/// redirect resolution through the next/ store dir in ways `require.resolve`
-/// from an arbitrary anchor does not reproduce.
-#[cfg(test)]
-fn node_can_resolve(
-    node_bin: &std::path::Path,
-    request: &str,
-    from_file: &str,
-) -> Result<(), String> {
-    // require.resolve with paths pinned to the server tree — same algorithm
-    // the server uses, no server code executed (fails in <1s or not at all).
-    let mut probe = String::from("try { require.resolve(");
-    probe.push_str(&format!("{request:?}, "));
-    probe.push_str(&format!("{{ paths: [{from_file:?}] }}));"));
-    probe.push_str("console.log('MAIC_RESOLVE_OK'); } catch (e) { console.error(String(e && e.message || e)); process.exit(1); }");
-    let mut cmd = Command::new(node_bin);
-    cmd.arg("-e").arg(probe);
-    #[cfg(windows)]
-    hide_console(&mut cmd);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("resolve probe failed to run: {e}"))?;
-    if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("MAIC_RESOLVE_OK") {
-        return Ok(());
-    }
-    Err(format!(
-        "node cannot resolve {request:?} (from {from_file}): {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    ))
-}
-
-/// Create a directory link: junction on Windows, symlink on unix.
-///
-/// A real directory COPY is NOT a valid substitute: pnpm's isolated layout
-/// requires `next` to live physically inside `.pnpm/next@…/node_modules/`
-/// next to its own deps, and Node's resolution walks the PHYSICAL parent
-/// chain. A copy at the link path resolves its own deps from the wrong
-/// ancestors and dies with MODULE_NOT_FOUND (verified locally). Junctions
-/// (like unix symlinks) keep the physical path inside the store, which is
-/// what makes resolution work.
-///
-/// Junctions use an absolute target so they survive regardless of the
-/// process working directory. `mklink /J` needs no privileges.
-#[cfg(windows)]
-fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    hide_console(&mut cmd);
-    let status = cmd
-        .status()
-        .map_err(|e| format!("failed to run mklink for {}: {e}", link.display()))?;
-    if !status.success() {
-        return Err(format!(
-            "failed to create junction {} -> {} (mklink exit: {status})",
-            link.display(),
-            target.display()
-        ));
-    }
-    Ok(())
-}
-
-/// Create a directory link: symlink on unix.
-#[cfg(not(windows))]
-fn create_dir_link(link: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
-    std::os::unix::fs::symlink(target, link).map_err(|e| {
-        format!(
-            "failed to symlink {} -> {}: {e}",
-            link.display(),
-            target.display()
-        )
-    })?;
-    Ok(())
-}
-
-/// How a manifest link should be restored on disk.
-#[derive(Debug, PartialEq, Eq)]
-enum LinkAction {
-    /// Target is a directory: junction on Windows, symlink on unix.
-    Junction,
-    /// Target is a file: copy its bytes.
-    CopyFile,
-}
-
-/// Classify a (link, target) pair. Pure logic, unit-tested on all platforms.
-fn link_plan(link: &std::path::Path, target: &std::path::Path) -> Result<LinkAction, String> {
-    // tar may have materialized the entry as a real file/dir already.
-    if link.exists() || std::fs::symlink_metadata(link).is_ok() {
-        return Err(format!("link already exists: {}", link.display()));
-    }
-    if target.is_dir() {
-        Ok(LinkAction::Junction)
-    } else if target.is_file() {
-        Ok(LinkAction::CopyFile)
-    } else {
-        Err(format!(
-            "link target missing: {} -> {}",
-            link.display(),
-            target.display()
-        ))
-    }
-}
-
-/// Parse the .links.json manifest into (link, target) pairs.
-/// Minimal hand parser: entries are exactly {"link": "…", "target": "…"}.
-/// (No serde_json Value parsing: keeps the manifest path dependency-free.)
-fn parse_links_manifest(text: &str) -> Result<Vec<(String, String)>, String> {
-    fn unescape(s: &str) -> Result<String, String> {
-        let mut out = String::with_capacity(s.len());
-        let mut it = s.chars();
-        while let Some(c) = it.next() {
-            if c != '\\' {
-                out.push(c);
-                continue;
-            }
-            match it.next() {
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some('/') => out.push('/'),
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('u') => {
-                    let hex: String = it.by_ref().take(4).collect();
-                    let cp = u32::from_str_radix(&hex, 16)
-                        .map_err(|_| format!("bad \\u escape in {s:?}"))?;
-                    out.push(char::from_u32(cp).ok_or_else(|| format!("bad codepoint in {s:?}"))?);
-                }
-                other => return Err(format!("bad escape in {s:?}: {other:?}")),
-            }
-        }
-        Ok(out)
-    }
-
-    fn field(obj: &str, key: &str) -> Result<String, String> {
-        let needle = format!("\"{key}\"");
-        let k = obj
-            .find(&needle)
-            .ok_or_else(|| format!("entry missing {key}: {obj:?}"))?;
-        let rest = obj[k + needle.len()..].trim_start();
-        let rest = rest
-            .strip_prefix(':')
-            .ok_or_else(|| format!("entry missing colon after {key}: {obj:?}"))?
-            .trim_start();
-        let body = rest
-            .strip_prefix('"')
-            .ok_or_else(|| format!("entry {key} is not a string: {obj:?}"))?;
-        let mut end = None;
-        let mut prev_backslash = false;
-        for (i, c) in body.char_indices() {
-            if c == '"' && !prev_backslash {
-                end = Some(i);
-                break;
-            }
-            prev_backslash = c == '\\' && !prev_backslash;
-        }
-        let end = end.ok_or_else(|| format!("unterminated {key}: {obj:?}"))?;
-        unescape(&body[..end])
-    }
-
-    let text = text.trim();
-    if !text.starts_with('[') || !text.ends_with(']') {
-        return Err("link manifest is not a JSON array".to_string());
-    }
-    // Split top-level {...} objects (manifest entries are flat).
-    let mut entries = Vec::new();
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut prev_backslash = false;
-    let mut start = None;
-    for (i, c) in text.char_indices() {
-        if in_str {
-            if c == '"' && !prev_backslash {
-                in_str = false;
-            }
-            prev_backslash = c == '\\' && !prev_backslash;
-            continue;
-        }
-        match c {
-            '"' => {
-                in_str = true;
-                prev_backslash = false;
-            }
-            '{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    if let Some(s) = start.take() {
-                        entries.push(&text[s..=i]);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    entries
-        .into_iter()
-        .map(|e| Ok((field(e, "link")?, field(e, "target")?)))
-        .collect()
-}
-
-/// Join a manifest-relative POSIX path onto a base dir, rejecting escapes.
-fn join_rel(base: &std::path::Path, rel: &str) -> Result<PathBuf, String> {
-    if rel.is_empty() {
-        return Err("empty path in link manifest".to_string());
-    }
-    let mut out = base.to_path_buf();
-    for part in rel.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
-            return Err(format!("unsafe path in link manifest: {rel:?}"));
-        }
-        // Reject Windows-absolute paths and drive prefixes smuggled in.
-        if part.contains(':') || part.contains('\\') {
-            return Err(format!("unsafe path in link manifest: {rel:?}"));
-        }
-        out.push(part);
-    }
-    Ok(out)
 }
 
 /// Read .build-meta.json out of the tarball without extracting it.
@@ -933,12 +552,11 @@ fn parse_url(url: &str) -> Option<(String, u16, String)> {
 /// Spawn the sidecar and block until /api/health is green.
 /// Returns the base URL plus the child handle (killed on app exit).
 ///
-/// Self-heal: a crash whose log shows MODULE_NOT_FOUND means the staged tree's
-/// restored link layout is broken in a way static checks cannot see (Windows
-/// junction chains resolve differently under Node than under
-/// `fs::canonicalize`; verified locally). In that case the tree is re-extracted
-/// from the bundled tarball exactly once and startup retried — the fresh
-/// extraction restores every link from `.links.json`.
+/// Self-heal: a crash whose log shows MODULE_NOT_FOUND means the staged tree
+/// is broken in a way the static checks above did not catch (a file quarantined
+/// or truncated after extraction). The tree is then re-extracted from the
+/// bundled tarball exactly once and startup retried — the bundle itself was
+/// boot-verified at build time, so a clean re-extraction is the repair.
 fn start_server(
     app: &tauri::AppHandle,
     server_dir: &std::path::Path,
@@ -1043,10 +661,9 @@ fn start_server(
                                 ),
                             };
                             // Broken staged tree (MODULE_NOT_FOUND in the log):
-                            // re-extract once — a fresh extraction restores
-                            // every link from .links.json — then pass 1
-                            // retries from the top. A genuinely bad bundle
-                            // still reports its error after the second pass.
+                            // re-extract once, then pass 1 retries from the
+                            // top. A genuinely bad bundle still reports its
+                            // error after the second pass.
                             if tail.contains("MODULE_NOT_FOUND") && pass == 0 {
                                 eprintln!(
                                     "maic-desktop: server crashed with MODULE_NOT_FOUND; re-extracting server tree and retrying"
@@ -1308,7 +925,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn only_main_owns_server_lifetime() {
@@ -1330,89 +946,6 @@ mod tests {
         assert_eq!(select_port(Some(53588), false, false), None);
         assert_eq!(select_port(None, false, false), None);
         assert_eq!(PREFERRED_PORT, 31846);
-    }
-
-    #[test]
-    fn parse_manifest_round_trip() {
-        let text = r#"[
-  {"link": "node_modules/next", "target": ".pnpm/next@16.3.3/node_modules/next"},
-  {"link": "node_modules/.pnpm/node_modules/has \"quote\"\\x", "target": "a/b"}
-]"#;
-        let pairs = parse_links_manifest(text).expect("parse");
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(
-            pairs[0],
-            (
-                "node_modules/next".to_string(),
-                ".pnpm/next@16.3.3/node_modules/next".to_string()
-            )
-        );
-        assert_eq!(
-            pairs[1].0,
-            "node_modules/.pnpm/node_modules/has \"quote\"\\x"
-        );
-    }
-
-    #[test]
-    fn parse_manifest_rejects_garbage() {
-        assert!(parse_links_manifest("not json").is_err());
-        assert!(parse_links_manifest("[{}]").is_err());
-        assert!(parse_links_manifest(r#"[{"link": 1, "target": "x"}]"#).is_err());
-        assert!(parse_links_manifest("[]").expect("empty").is_empty());
-    }
-
-    #[test]
-    fn join_rel_blocks_escapes() {
-        let base = std::path::Path::new("/data/server");
-        assert_eq!(
-            join_rel(base, "node_modules/next").unwrap(),
-            base.join("node_modules/next")
-        );
-        for evil in ["", ".", "..", "a/../../etc", "C:/win", "a\\b", "a:b"] {
-            assert!(join_rel(base, evil).is_err(), "should reject {evil:?}");
-        }
-    }
-
-    #[test]
-    fn link_plan_classifies_targets() {
-        let dir = std::env::temp_dir().join(format!("maic-plan-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("store/pkg")).unwrap();
-        fs::write(dir.join("store/pkg/index.js"), "x").unwrap();
-
-        // Directory target -> junction.
-        let plan = link_plan(&dir.join("node_modules/next"), &dir.join("store/pkg"));
-        assert!(plan.is_ok(), "plan failed: {plan:?}");
-        assert_eq!(plan.unwrap(), LinkAction::Junction);
-
-        // File target -> copy.
-        let plan = link_plan(
-            &dir.join("node_modules/a.js"),
-            &dir.join("store/pkg/index.js"),
-        );
-        assert!(plan.is_ok(), "plan failed: {plan:?}");
-        assert_eq!(plan.unwrap(), LinkAction::CopyFile);
-
-        // Missing target -> error mentioning both paths.
-        let err = link_plan(&dir.join("node_modules/gone"), &dir.join("store/nope")).unwrap_err();
-        assert!(
-            err.contains("gone") && err.contains("nope"),
-            "bad error: {err}"
-        );
-
-        // Existing link path -> error (tar already materialized it).
-        fs::write(dir.join("node_modules_taken"), "y").unwrap_or_else(|_| {
-            fs::create_dir_all(dir.join("nm")).unwrap();
-            fs::write(dir.join("nm/taken"), "y").unwrap();
-        });
-        let taken = if dir.join("node_modules_taken").exists() {
-            dir.join("node_modules_taken")
-        } else {
-            dir.join("nm/taken")
-        };
-        assert!(link_plan(&taken, &dir.join("store/pkg")).is_err());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -1455,9 +988,8 @@ mod verify_tree_tests {
         let dir = std::env::temp_dir().join(format!("maic-verify-ok-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        // next/ must resolve with dist/server; helpers reachable by walking up
-        // from the canonical next dir into .pnpm store is complex in tmp, so
-        // place helpers where the walk finds it: node_modules/@swc/helpers at root.
+        // The shipped tree is hoisted and link-free: `next` sits in
+        // node_modules/next and finds its helpers in the same node_modules.
         fs::write(dir.join("server.js"), "x").unwrap();
         let next = dir.join("node_modules").join("next");
         fs::create_dir_all(next.join("dist").join("server")).unwrap();
@@ -1501,6 +1033,40 @@ mod verify_tree_tests {
         fs::write(helpers.join("package.json"), r#"{"exports": {}}"#).unwrap();
         let err = verify_server_tree(&dir).unwrap_err();
         assert!(err.contains("@swc/helpers"), "bad error: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_fails_on_the_broken_windows_tree() {
+        // Regression guard for the shipped-Windows crash: `node_modules/next`
+        // was a real directory (its link never reached the manifest), so Node
+        // resolved it lexically and never walked into the pnpm store where its
+        // helpers live. Verification passed anyway because it accepted the
+        // `.pnpm/node_modules` hoist bridge. It must fail.
+        let dir = std::env::temp_dir().join(format!("maic-verify-bridge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("server.js"), "x").unwrap();
+        let next = dir.join("node_modules").join("next");
+        fs::create_dir_all(next.join("dist").join("server")).unwrap();
+        let bridge = dir
+            .join("node_modules")
+            .join(".pnpm")
+            .join("node_modules")
+            .join("@swc")
+            .join("helpers");
+        fs::create_dir_all(bridge.join("cjs")).unwrap();
+        fs::write(
+            bridge.join("package.json"),
+            r#"{"exports": {"./_/_interop_require_default": {"default": "./cjs/x.cjs"}}}"#,
+        )
+        .unwrap();
+        fs::write(bridge.join("cjs").join("_interop_require_default.cjs"), "c").unwrap();
+        let err = verify_server_tree(&dir).unwrap_err();
+        assert!(
+            err.contains("@swc/helpers") && err.contains("not resolvable"),
+            "bad error: {err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

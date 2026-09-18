@@ -14,8 +14,9 @@
 //   src-tauri/binaries/openmaic-node-<triple>[.exe] — downloaded Node 22 LTS binary
 //   src-tauri/resources/server/.build-meta.json — provenance record
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
+import { createServer } from 'node:http';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -74,33 +75,38 @@ async function pathExists(p) {
   }
 }
 
+// Standalone staging copy. `dereference:false` so a link is never silently
+// expanded into a partial real dir (fatal under pnpm's isolated layout); any
+// link that survives is materialized by materializeLinks() below, so the
+// shipped tree is link-free and identical on every host.
 async function copyDir(src, dest) {
   await fs.mkdir(dest, { recursive: true });
-  // verbatimSymlinks:false would dereference junctions/symlinks into REAL
-  // dirs — fatal on Windows, where pnpm uses junctions: the staged tree
-  // would carry a partial real copy of e.g. node_modules/next that shadows
-  // the store, and Node's module walk would then miss @swc/helpers
-  // (MODULE_NOT_FOUND at runtime). dereference:false keeps the link itself
-  // (as a junction on Windows) so link detection below sees it.
   await fs.cp(src, dest, { recursive: true, dereference: false });
 }
 
-// Standalone staging copy. Next's standalone output mirrors pnpm's symlinked
-// layout: top-level entries like node_modules/next are links (often absolute)
-// into isolated .pnpm store dirs, and Node relies on realpath-ing through them
-// to find isolated deps (@swc/helpers, sharp, …). Expanding links to real
-// files breaks that mechanism, so links are preserved — but absolute links
-// pointing back at the build machine's source tree would dangle on the user's
-// machine. Rewrite them as tree-relative links into the staged copy:
-//   <standaloneDir>/…  ->  <resourcesDir>/…
-// Collect every symlink/junction under dir as { link, target } pairs, both
-// expressed with POSIX separators relative to dir. Written to
-// server/.links.json so the desktop shell can restore links on platforms
-// where the tarball transport cannot carry them (Windows bsdtar drops them;
-// the shell recreates them as junctions). readdir's withFileTypes may report
-// junctions as plain directories, so each directory entry is double-checked
-// with lstat.
-async function collectLinks(dir) {
+// Copy a file/dir tree, resolving through symlinks (like `cp -rL`).
+// `chain` carries the realpath stack being expanded; re-entering one is a
+// link cycle, which would otherwise recurse until the path limit.
+async function copyResolved(src, dest, chain = []) {
+  const real = await fs.realpath(src).catch(() => path.resolve(src));
+  if (chain.includes(real)) {
+    throw new Error(`symlink cycle while materializing ${src} (-> ${real})`);
+  }
+  const st = await fs.stat(src);
+  if (st.isDirectory()) {
+    await fs.mkdir(dest, { recursive: true });
+    for (const e of await fs.readdir(src)) {
+      await copyResolved(path.join(src, e), path.join(dest, e), [...chain, real]);
+    }
+  } else {
+    await fs.copyFile(src, dest);
+  }
+}
+
+// Every symlink/junction under dir, as tree-relative POSIX paths. Junctions
+// can surface as plain directories in readdir's withFileTypes, so each
+// directory entry is double-checked with lstat (authoritative on Windows too).
+async function findLinks(dir) {
   const out = [];
   async function walk(cur) {
     const entries = await fs.readdir(cur, { withFileTypes: true });
@@ -111,166 +117,71 @@ async function collectLinks(dir) {
         isLink = (await fs.lstat(p)).isSymbolicLink();
       }
       if (isLink) {
-        const raw = await fs.readlink(p);
-        const abs = path.resolve(path.dirname(p), raw);
-        let relTarget;
-        if (abs === dir || abs.startsWith(dir + path.sep)) {
-          relTarget = path.relative(dir, abs).split(path.sep).join('/');
-        } else {
-          relTarget = raw.split(path.sep).join('/');
-        }
-        out.push({
-          link: path.relative(dir, p).split(path.sep).join('/'),
-          target: relTarget,
-        });
+        out.push(path.relative(dir, p).split(path.sep).join('/'));
       } else if (e.isDirectory()) {
         await walk(p);
       }
     }
   }
   await walk(dir);
-  out.sort((a, b) => (a.link < b.link ? -1 : a.link > b.link ? 1 : 0));
   return out;
 }
 
-// Copy a file/dir tree, resolving through symlinks (like `cp -rL`).
-async function copyResolved(src, dest) {
-  const st = await fs.stat(src);
-  if (st.isDirectory()) {
-    await fs.mkdir(dest, { recursive: true });
-    for (const e of await fs.readdir(src)) {
-      await copyResolved(path.join(src, e), path.join(dest, e));
+// Replace every remaining symlink/junction with a real copy of its target
+// (dangling links are dropped), until the tree is link-free. Materializing an
+// outer link can expose inner ones, so this re-scans until findLinks is empty.
+//
+// This is what makes the bundle platform-agnostic: after this pass the tarball
+// carries no link entries, Windows bsdtar has nothing to mangle, the shell has
+// nothing to recreate (no `mklink`, no privilege/AV/long-path failure modes),
+// and Node resolves from the same physical layout it was tested with at build
+// time. Safe because the staged tree is a hoisted (npm-style) node_modules: a
+// package's dependencies are reachable from its ancestors even when the
+// package sits at the link path rather than inside a .pnpm store dir.
+async function materializeLinks(dir) {
+  let total = 0;
+  let dropped = 0;
+  for (let pass = 0; ; pass++) {
+    const links = await findLinks(dir);
+    if (links.length === 0) {
+      if (total || dropped) {
+        console.log(`materialized ${total} links into real files (${dropped} dangling dropped)`);
+      }
+      return { total, dropped };
     }
-  } else {
-    await fs.copyFile(src, dest);
+    if (pass > 9) {
+      throw new Error(`links keep appearing after ${pass} passes — ${links.length} left, e.g. ${links[0]}`);
+    }
+    for (const rel of links) {
+      const p = path.join(dir, ...rel.split('/'));
+      const raw = await fs.readlink(p);
+      const abs = path.resolve(path.dirname(p), raw);
+      await fs.rm(p);
+      let alive = true;
+      try {
+        await fs.stat(abs);
+      } catch {
+        alive = false;
+      }
+      if (!alive) {
+        dropped++;
+        continue;
+      }
+      await copyResolved(abs, p);
+      total++;
+    }
   }
 }
 
-// Replace every symlink pointing OUTSIDE the staged tree with a real copy
-// of its target (or delete it when the target is gone). Next.js standalone
-// tracing on Windows leaves links into the workspace root node_modules
-// (e.g. D:/a/…/openmaic-src/node_modules/…) that cannot be shipped: the
-// manifest only allows tree-relative targets and the Rust side refuses
-// absolute/escaping paths. Must run BEFORE collectLinks/stripLinks.
-async function materializeExternalLinks(stagedDir) {
-  let count = 0;
-  async function walk(cur) {
-    const entries = await fs.readdir(cur, { withFileTypes: true });
-    for (const e of entries) {
-      const p = path.join(cur, e.name);
-      // Junctions can surface as plain directories in withFileTypes.
-      let isLink = e.isSymbolicLink();
-      if (!isLink && e.isDirectory()) {
-        isLink = (await fs.lstat(p)).isSymbolicLink();
-      }
-      if (isLink) {
-        const raw = await fs.readlink(p);
-        const abs = path.resolve(path.dirname(p), raw);
-        if (abs === stagedDir || abs.startsWith(stagedDir + path.sep)) {
-          continue; // inside the tree: relink/strip handles it later
-        }
-        let alive = false;
-        try {
-          await fs.stat(abs);
-          alive = true;
-        } catch {
-          // dangling: drop it, nothing requires it at runtime
-        }
-        await fs.rm(p);
-        if (alive) {
-          await copyResolved(abs, p);
-          count++;
-        }
-      } else if (e.isDirectory()) {
-        await walk(p);
-      }
-    }
+// Hard gate: a single surviving link means the shipped tree differs per
+// platform (and Windows is the one that breaks), so refuse to bundle it.
+async function assertNoLinks(dir) {
+  const links = await findLinks(dir);
+  if (links.length > 0) {
+    throw new Error(
+      `staged server tree still has ${links.length} symlinks/junctions (e.g. ${links.slice(0, 5).join(', ')}) — refusing to bundle`,
+    );
   }
-  await walk(stagedDir);
-  console.log(`materialized ${count} external links into the staged tree`);
-}
-
-// Delete every symlink (and junction) under dir (files stay). Used before
-// packing the tarball: Windows bsdtar cannot extract symlink entries (it
-// mangles them into \\?\C:\… paths and aborts with "Invalid argument"). The
-// removed links are fully described by .links.json and restored at launch.
-// readdir's withFileTypes may report junctions as plain directories on some
-// Node/libuv combos, so each directory entry is double-checked with lstat.
-async function stripLinks(dir) {
-  let count = 0;
-  async function walk(cur) {
-    const entries = await fs.readdir(cur, { withFileTypes: true });
-    for (const e of entries) {
-      const p = path.join(cur, e.name);
-      if (e.isSymbolicLink()) {
-        await fs.rm(p);
-        count++;
-      } else if (e.isDirectory()) {
-        // Junctions can surface as plain directories in withFileTypes;
-        // lstat is authoritative (isSymbolicLink covers both links and
-        // junctions on Windows).
-        const st = await fs.lstat(p);
-        if (st.isSymbolicLink()) {
-          await fs.rm(p);
-          count++;
-        } else {
-          await walk(p);
-        }
-      }
-    }
-  }
-  await walk(dir);
-  console.log(`stripped ${count} symlinks/junctions before packing`);
-}
-
-async function relinkStagedTree(standaloneDir, resourcesDir) {
-  async function walk(dir) {
-    const entries = await fs.readdir(dir, { withFileTypes: true });
-    for (const e of entries) {
-      const p = path.join(dir, e.name);
-      // Junctions (Windows pnpm layout) can surface as plain directories in
-      // withFileTypes — double-check with lstat so every link is rewritten.
-      let isLink = e.isSymbolicLink();
-      if (!isLink && e.isDirectory()) {
-        isLink = (await fs.lstat(p)).isSymbolicLink();
-      }
-      if (isLink) {
-        const raw = await fs.readlink(p);
-        const abs = path.resolve(path.dirname(p), raw);
-        if (abs === standaloneDir || abs.startsWith(standaloneDir + path.sep)) {
-          const rel = path.relative(
-            path.dirname(p),
-            path.join(resourcesDir, path.relative(standaloneDir, abs)),
-          );
-          await fs.rm(p);
-          // pnpm's layout relies on links resolving INSIDE the tree. On
-          // Windows a relative dir symlink needs privileges; a junction
-          // (absolute target) is the no-privilege equivalent and is what
-          // pnpm itself uses.
-          if (process.platform === 'win32') {
-            const absTarget = path.resolve(path.dirname(p), rel);
-            await fs.rm(p, { force: true, recursive: true });
-            await fs.symlink(absTarget, p, 'junction');
-          } else {
-            await fs.symlink(rel, p);
-          }
-          // The rewritten target may itself be stale (e.g. pnpm's has-flag
-          // ghost entry): drop it if nothing exists there.
-          try {
-            await fs.stat(p);
-          } catch {
-            await fs.rm(p, { force: true });
-          }
-        } else if (!(await pathExists(abs))) {
-          await fs.rm(p, { force: true }); // dangling + outside the tree: drop it
-        }
-        // else: link points outside the tree but target exists — keep as is.
-      } else if (e.isDirectory()) {
-        await walk(p);
-      }
-    }
-  }
-  await walk(resourcesDir);
 }
 
 async function resolveNode22Latest() {
@@ -356,6 +267,80 @@ async function stageNodeBinary(triple, version) {
   return outName;
 }
 
+// Boot the packed server from a clean extraction, the way the desktop shell
+// does on first launch: unpack the tarball, run `node server.js`, wait for
+// /api/health. This is the only check that catches a broken bundle before it
+// ships — static "can the file be stat'd" probes passed on Windows right up to
+// Node's own module walk failing, because Next resolves through the physical
+// layout, not the lexical one.
+async function smokeTestBundledTarball(tarballPath, nodeBin, label) {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'maic-server-smoke-'));
+  const serverDir = path.join(tmp, 'server');
+  let child = null;
+  let tail = '';
+  const keep = (chunk) => {
+    tail = (tail + String(chunk)).slice(-8000);
+  };
+  try {
+    run('tar', ['-xzf', tarballPath, '-C', tmp]);
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}/api/health`;
+    console.log(`smoke boot: ${nodeBin} → ${url} (${label})`);
+    child = spawn(nodeBin, [path.join(serverDir, 'server.js')], {
+      cwd: serverDir,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        HOSTNAME: '127.0.0.1',
+        NODE_ENV: 'production',
+        NEXT_TELEMETRY_DISABLED: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.on('data', keep);
+    child.stderr.on('data', keep);
+
+    const deadline = Date.now() + 120_000;
+    for (;;) {
+      if (child.exitCode !== null) {
+        throw new Error(
+          `smoke boot failed: server exited with code ${child.exitCode} before serving ${url}\n` +
+            `--- server output ---\n${tail}`,
+        );
+      }
+      try {
+        if ((await fetch(url)).ok) {
+          console.log('smoke boot: server is healthy, bundle verified');
+          return;
+        }
+      } catch {
+        // not listening yet
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`smoke boot failed: ${url} never answered\n--- server output ---\n${tail}`);
+      }
+      await sleep(250);
+    }
+  } finally {
+    if (child && child.exitCode === null) child.kill();
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+}
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const triple = args.target || hostTriple();
@@ -366,7 +351,10 @@ async function main() {
   }
 
   if (!args.skipBuild) {
-    run('pnpm', ['--dir', srcDir, 'install', '--frozen-lockfile']);
+    // Hoisted (npm-style) node_modules: no .pnpm symlinks/junctions for the
+    // server's own deps, so the staged tree can be made link-free and the
+    // bundle then behaves the same on macOS, Linux and Windows.
+    run('pnpm', ['--dir', srcDir, 'install', '--frozen-lockfile', '--config.node-linker=hoisted']);
     run('pnpm', ['--dir', srcDir, 'build']);
   }
 
@@ -381,10 +369,19 @@ async function main() {
   await fs.rm(resourcesDir, { recursive: true, force: true });
   await fs.mkdir(resourcesDir, { recursive: true });
   await copyDir(standaloneDir, resourcesDir);
-  await relinkStagedTree(standaloneDir, resourcesDir);
   // Dockerfile parity: standalone output expects .next/static and public alongside server.js.
   await copyDir(staticDir, path.join(resourcesDir, '.next', 'static'));
   if (await pathExists(publicDir)) await copyDir(publicDir, path.join(resourcesDir, 'public'));
+
+  // Guard: an isolated (default pnpm) layout shows up as hundreds of links into
+  // a .pnpm store. Materializing those would balloon the bundle and mask a
+  // stale --skip-build, so refuse and ask for a hoisted rebuild.
+  const stagedLinks = await findLinks(resourcesDir);
+  if (stagedLinks.length > 100) {
+    throw new Error(
+      `staged tree carries ${stagedLinks.length} links (pnpm isolated layout?) — rerun without --skip-build so the install uses --config.node-linker=hoisted`,
+    );
+  }
 
   let nodeVersion = null;
   let binaryName = null;
@@ -393,6 +390,18 @@ async function main() {
     console.log(`resolved Node 22 LTS: ${nodeVersion}`);
     binaryName = await stageNodeBinary(triple, nodeVersion);
   }
+
+  // Which node binary the smoke boot runs: the staged sidecar when it matches
+  // this host (exactly what ships), otherwise the host's own node — a
+  // cross-target --target cannot exec the shipped binary, but the tree layout
+  // check still applies.
+  const nativeTarget = triple === hostTriple();
+  const nodeBin =
+    binaryName && nativeTarget
+      ? path.join(binariesDir, binaryName)
+      : process.execPath;
+  const smokeLabel =
+    binaryName && nativeTarget ? 'bundled sidecar' : 'host node (sidecar not staged for this target)';
 
   let submoduleSha = 'unknown';
   try {
@@ -407,47 +416,45 @@ async function main() {
     binary: binaryName,
     submoduleSha,
     portStrategy: 'dynamic-loopback',
+    // Bumped layout marker: the shipped tree is symlink-free, so the shell has
+    // no links to recreate. Changing this string forces every installed app to
+    // re-extract exactly once (the shell compares the whole JSON blob).
+    layout: 'symlink-free-hoisted',
     stagedAt: new Date().toISOString(),
   };
   await fs.writeFile(path.join(resourcesDir, '.build-meta.json'), JSON.stringify(meta, null, 2));
   console.log('build meta:', JSON.stringify(meta));
 
-  // Fold workspace-external links (Windows tracing leaves absolute links
-  // into the source node_modules) into real files BEFORE the manifest is
-  // collected — the manifest only allows tree-relative targets.
-  await materializeExternalLinks(resourcesDir);
+  // Ship a tree with ZERO symlinks/junctions. Under pnpm's default isolated
+  // layout that was impossible (Node only finds `next`'s deps inside the
+  // .pnpm store dir, so the links had to survive the trip through the
+  // installer — and Windows cannot carry them: bsdtar mangles symlink entries,
+  // and junctions restored at launch proved unreliable). Installing the
+  // submodule with a hoisted (npm-style) node-linker instead puts every
+  // package in a real directory reachable from its ancestors, so links are
+  // materialized here rather than transported. Host link semantics (macOS
+  // symlinks vs Windows junctions vs each installer's quirks) no longer affect
+  // the bundle, and long-path pressure on Windows drops away with the
+  // `.pnpm/<name>@<ver>_<peer-hash>` store segments.
+  await materializeLinks(resourcesDir);
+  await assertNoLinks(resourcesDir);
 
-  // Symlink manifest for restoring links after extraction. The shell
-  // recreates every entry at first launch (junctions on Windows, symlinks
-  // elsewhere) because the tarball below ships zero symlinks.
-  const links = await collectLinks(resourcesDir);
-  await fs.writeFile(
-    path.join(resourcesDir, '.links.json'),
-    JSON.stringify(links, null, 2),
-  );
-  console.log(`link manifest: ${links.length} links`);
-
-  // Remove every symlink from the staged tree BEFORE packing. Windows bsdtar
-  // turns symlink entries into \\?\C:\…-prefixed paths at extract time,
-  // which fails with "Invalid argument" and aborts the whole extraction.
-  // The tree is fully described by .links.json, so nothing is lost.
-  await stripLinks(resourcesDir);
-
-  // Tauri's resource bundler does not preserve symlinks (it materializes them
-  // or drops them), which breaks pnpm's isolated-deps layout — and Windows
-  // bsdtar mangles symlink entries into \\?\C:\… paths and aborts extraction.
-  // So the tarball ships zero symlinks (stripped above); the shell restores
-  // them from .links.json at first launch. The tarball also shrinks the
-  // installer substantially.
+  // Tauri's resource bundler does not preserve symlinks, and tarballing the
+  // tree keeps the installer small and fast. There are no symlinks left to
+  // lose, so the archive is a plain directory snapshot.
   const tarballPath = path.join(path.dirname(resourcesDir), 'server.tar.gz');
   await fs.rm(tarballPath, { force: true });
   run('tar', ['-czf', tarballPath, '-C', path.dirname(resourcesDir), 'server']);
   const tarStat = await fs.stat(tarballPath);
-  const dirStat = await fs.stat(resourcesDir);
   console.log(
     `server tarball: ${(tarStat.size / 1048576).toFixed(1)} MB (unpacked dir staged at ${resourcesDir})`,
   );
-  void dirStat;
+
+  // Build-time gate: unpack the tarball somewhere clean and boot the real
+  // server from it, exactly as the desktop shell will on first launch. This is
+  // the only check that reproduces Windows' failure mode — static probes passed
+  // there while Node's own module walk did not.
+  await smokeTestBundledTarball(tarballPath, nodeBin, smokeLabel);
   console.log('prepare-server done.');
   console.log(`NOTE: src-tauri/resources/server/ stays on disk for 'tauri dev'; release bundles ship ${path.basename(tarballPath)}.`);
 }
