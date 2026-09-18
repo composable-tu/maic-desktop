@@ -141,6 +141,7 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
                 "maic-desktop: using dev server tree at {}",
                 dev_dir.display()
             );
+            splash_status(app, STATUS_VERIFYING, None);
             verify_server_tree(&dev_dir)?;
             return Ok(dev_dir);
         }
@@ -168,16 +169,19 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let server_dir = data_dir.join("server");
 
     if current != staged_meta || !server_dir.join("server.js").exists() {
-        stage_fresh_server(&tarball, &data_dir, &server_dir, &staged_meta)?;
+        splash_status(app, STATUS_EXTRACTING, None);
+        stage_fresh_server(app, &tarball, &data_dir, &server_dir, &staged_meta)?;
     } else {
         println!("maic-desktop: reusing extracted server runtime");
+        splash_status(app, STATUS_REUSING, None);
         // A reused tree is not necessarily healthy: files can go missing after
         // staging (cleaner tools, AV quarantine, a crash mid-extraction) while
         // the marker still matches. Re-verify on every launch — cheap — and
         // re-extract once when broken instead of crash-looping the server.
         if let Err(e) = verify_server_tree(&server_dir) {
             eprintln!("maic-desktop: staged server failed validation ({e}); re-extracting");
-            stage_fresh_server(&tarball, &data_dir, &server_dir, &staged_meta)?;
+            splash_status(app, STATUS_EXTRACTING, None);
+            stage_fresh_server(app, &tarball, &data_dir, &server_dir, &staged_meta)?;
         }
     }
     Ok(server_dir)
@@ -187,6 +191,7 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// and record the marker. Used for first launch, updates, and one-shot repair
 /// of a damaged staged tree.
 fn stage_fresh_server(
+    app: &tauri::AppHandle,
     tarball: &std::path::Path,
     data_dir: &std::path::Path,
     server_dir: &std::path::Path,
@@ -206,6 +211,7 @@ fn stage_fresh_server(
         })?;
     }
     extract_tarball(tarball, data_dir)?;
+    splash_status(app, STATUS_VERIFYING, None);
     // Fail fast with a precise message instead of a deep MODULE_NOT_FOUND.
     verify_server_tree(server_dir)?;
     std::fs::write(data_dir.join(".build-meta.json"), staged_meta)
@@ -346,6 +352,7 @@ fn read_bundled_meta(tarball: &std::path::Path) -> Result<String, String> {
 /// A copy living outside the bundle (plus the ad-hoc signature applied at
 /// stage time) registers as BackgroundOnly and stays out of the Dock.
 fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, String> {
+    splash_status(app, STATUS_STAGING, None);
     let exe = std::env::current_exe().map_err(|e| format!("failed to locate app binary: {e}"))?;
     let dir = exe
         .parent()
@@ -590,6 +597,7 @@ fn start_server(
                 Some(p) => p,
                 None => pick_free_port()?,
             };
+            splash_status(app, STATUS_PROBING, Some(port));
             let mut cmd = Command::new(node_bin);
             cmd.arg(server_js.to_string_lossy().to_string())
                 .env("PORT", port.to_string())
@@ -678,7 +686,14 @@ fn start_server(
                                     .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
                                 let staged_meta = read_bundled_meta(&tarball)
                                     .unwrap_or_else(|_| "{}".to_string());
-                                stage_fresh_server(&tarball, &data_dir, server_dir, &staged_meta)?;
+                                splash_status(app, STATUS_EXTRACTING, None);
+                                stage_fresh_server(
+                                    app,
+                                    &tarball,
+                                    &data_dir,
+                                    server_dir,
+                                    &staged_meta,
+                                )?;
                                 break;
                             }
                             // Try another port.
@@ -739,7 +754,7 @@ fn boot_in_background(app: &tauri::AppHandle) {
         .resolve("resources/server.tar.gz", BaseDirectory::Resource)
         .map(|t| read_bundled_meta(&t).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_else(|_| "{}".to_string());
-    splash_status(app, STATUS_PREPARING);
+    splash_status(app, STATUS_CHECKING, None);
     let server_dir = match ensure_server(app) {
         Ok(dir) => dir,
         Err(msg) => return boot_failed(app, &msg),
@@ -748,7 +763,6 @@ fn boot_in_background(app: &tauri::AppHandle) {
         Ok(bin) => bin,
         Err(msg) => return boot_failed(app, &msg),
     };
-    splash_status(app, STATUS_STARTING);
     let (url, child) = match start_server(app, &server_dir, &node_bin) {
         Ok(pair) => {
             println!("maic-desktop: serving {}", pair.0);
@@ -782,20 +796,28 @@ fn boot_in_background(app: &tauri::AppHandle) {
     }
 }
 
-/// Status keys the splash translates. The wording lives in `STRINGS` inside
-/// splash.html so it can follow the webview's locale; `splash_status` carries
-/// only the key.
-const STATUS_PREPARING: &str = "preparing";
-const STATUS_STARTING: &str = "starting";
+/// Boot stages the splash names. The wording lives in `STRINGS` inside
+/// splash.html so it can follow the webview's locale; the shell only carries
+/// the key, plus the bound port for `probing`.
+const STATUS_CHECKING: &str = "checking";
+const STATUS_EXTRACTING: &str = "extracting";
+const STATUS_REUSING: &str = "reusing";
+const STATUS_VERIFYING: &str = "verifying";
+const STATUS_STAGING: &str = "staging";
+const STATUS_PROBING: &str = "probing";
 
-/// Push a status line to the splash window (best effort). Evals can be dropped
+/// Push a boot stage to the splash window (best effort). Evals can be dropped
 /// while the page is still loading, so the build-target footer rides along with
 /// every push: whichever one first reaches the document paints the whole page.
-fn splash_status(app: &tauri::AppHandle, key: &str) {
+fn splash_status(app: &tauri::AppHandle, key: &str, port: Option<u16>) {
     if let Some(splash) = app.get_webview_window("splash") {
         let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
+        let port_js = match port {
+            Some(p) => format!("\"{p}\""),
+            None => "undefined".to_string(),
+        };
         let _ = splash.eval(format!(
-            "window.__maicStatus && window.__maicStatus(\"{escaped}\");\
+            "window.__maicStatus && window.__maicStatus(\"{escaped}\",{port_js});\
              window.__maicTarget && window.__maicTarget({:?})",
             build_target_label()
         ));
@@ -976,12 +998,27 @@ mod tests {
         // The wording lives in splash.html and the shell only carries keys, so a
         // rename on one side alone would silently print a raw key in the window.
         const SPLASH: &str = include_str!("../frontend-dist/splash.html");
-        for key in [STATUS_PREPARING, STATUS_STARTING, "failed"] {
+        for key in [
+            STATUS_CHECKING,
+            STATUS_EXTRACTING,
+            STATUS_REUSING,
+            STATUS_VERIFYING,
+            STATUS_STAGING,
+            STATUS_PROBING,
+            "failed",
+        ] {
             assert!(
                 SPLASH.contains(&format!("{key}:")),
                 "splash.html has no STRINGS entry for {key:?}"
             );
         }
+        // `probing` is the one parameterized stage: both locales need the slot,
+        // or the splash prints a literal "{port}". The page's own substitution
+        // call mentions it as well, so that is three occurrences.
+        assert!(
+            SPLASH.matches("{port}").count() >= 3,
+            "probing lost its {{port}} slot"
+        );
     }
 
     #[test]

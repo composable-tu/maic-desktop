@@ -5,7 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>MAIC Desktop</title>
     <style>
-      :root { color-scheme: dark; }
+      :root {
+        color-scheme: dark;
+        --h1-size: clamp(20px, 5.5vw, 28px);
+        --status-size: clamp(13px, 3.5vw, 15px);
+      }
       * { box-sizing: border-box; }
       html, body { height: 100%; }
       body {
@@ -59,17 +63,25 @@
         box-shadow: 0 0 10px rgba(255, 255, 255, 0.8);
       }
       .line.done > div::after { display: none; }
-      .text { min-width: 0; margin-left: clamp(5px, 1.5vw, 10px); }
+      .text {
+        min-width: 0; margin-left: clamp(5px, 1.5vw, 10px); position: relative;
+        /* The unit centred against the logo is title + ONE subtitle line, held
+           open even when the subtitle wraps: wrapping then only grows downward,
+           so nothing shifts, while the pair still reads as one balanced block. */
+        height: calc(var(--h1-size) * 1.15 + var(--status-size) * 1.2);
+      }
       h1 {
-        font-size: clamp(20px, 5.5vw, 28px); margin: 0 0 4px; font-weight: 600;
+        font-size: var(--h1-size); margin: 0; font-weight: 600;
         letter-spacing: -0.01em; line-height: 1.15; white-space: nowrap;
       }
-      #status { font-size: clamp(13px, 3.5vw, 15px); color: #888; min-height: 1.2em; white-space: nowrap; }
-      /* Two stacked cells: .sizer holds the widest line ever pushed, so the
-         row's centered width stops depending on which status is showing. */
-      #status { display: grid; }
-      #status > span { grid-area: 1 / 1; justify-self: start; }
-      #status .sizer { visibility: hidden; }
+      #status {
+        font-size: var(--status-size); color: #888;
+        /* Out of flow, in the reserved line under the title. Fixed width so a
+           long stage wraps instead of sliding the centred row. */
+        position: absolute; top: calc(var(--h1-size) * 1.15); left: 0;
+        margin-top: 4px;
+        width: clamp(140px, 37.3vw, 190px);
+      }
       /* Status lines used to hard-cut; a short rise-in makes the swap read as
          progress rather than a flicker. */
       @keyframes statusIn { from { opacity: 0; transform: translateY(4px); } }
@@ -101,7 +113,7 @@
       <div class="line" id="bar"><div></div></div>
       <div class="text">
         <h1>MAIC Desktop</h1>
-        <div id="status"><span class="cur">Preparing local server…</span><span class="sizer" aria-hidden="true"></span></div>
+        <div id="status">Checking bundle metadata</div>
       </div>
     </div>
     <div id="error"></div>
@@ -112,14 +124,22 @@
       // than blanking the line.
       var STRINGS = {
         en: {
-          preparing: 'Preparing local server……',
-          starting: 'Starting local server……',
+          checking: 'Checking bundle metadata',
+          extracting: 'Extracting bundle',
+          reusing: 'Bundle current, skipping',
+          verifying: 'Verifying next + @swc/helpers',
+          staging: 'Staging Node runtime',
+          probing: 'Starting :{port}, probing',
           failed: 'Startup failed',
           brand: 'Unofficial OpenMAIC Desktop'
         },
         zh: {
-          preparing: '准备本地服务……',
-          starting: '启动本地服务……',
+          checking: '核对服务包构建信息',
+          extracting: '解压服务包',
+          reusing: '服务包已最新，跳过解压',
+          verifying: '检查依赖树 next/@swc',
+          staging: '复制 Node 到数据目录',
+          probing: '启动 :{port} 并探活',
           failed: '启动失败',
           brand: '非官方 OpenMAIC Desktop'
         }
@@ -133,24 +153,17 @@
       document.getElementById('brand').textContent = T.brand;
 
       var statusEl = document.getElementById('status');
-      var curEl = statusEl.querySelector('.cur');
-      var sizerEl = statusEl.querySelector('.sizer');
-      window.__maicStatus = function (key) {
-        var msg = T[key] || key;
-        var changed = curEl.textContent !== msg;
-        if (changed) curEl.textContent = msg;
-        // Grow the reserved width only, so a longer line can never re-center
-        // the row and slide the logo and title sideways. Runs even when the
-        // text is unchanged: the shell re-sends the line the page ships with.
-        if (curEl.offsetWidth > sizerEl.offsetWidth) sizerEl.textContent = msg;
-        if (!changed) return;
+      window.__maicStatus = function (key, port) {
+        var msg = (T[key] || key).replace('{port}', port || '');
+        if (statusEl.textContent === msg) return;
+        statusEl.textContent = msg;
         statusEl.classList.remove('in');
         void statusEl.offsetWidth; // reflow, so the next push replays the animation
         statusEl.classList.add('in');
       };
       // Resolve the shipping line through the dictionary, so the markup's
       // English default is replaced before the first paint.
-      window.__maicStatus('preparing');
+      window.__maicStatus('checking');
       window.__maicTarget = function (text) {
         document.getElementById('target').textContent = text;
       };
