@@ -11,10 +11,14 @@ pub(crate) const STATUS_VERIFYING: &str = "verifying";
 pub(crate) const STATUS_STAGING: &str = "staging";
 pub(crate) const STATUS_PROBING: &str = "probing";
 
-/// Escape a string for embedding inside a JS string literal: raw quotes,
-/// backslashes, or line terminators would break the literal.
+/// Render `s` as a complete JavaScript string literal — including the
+/// surrounding quotes — with quotes, backslashes, and line terminators
+/// escaped. Callers splice the result straight into generated JS; a version
+/// that returned only the escaped content kept producing SyntaxErrors
+/// whenever a splice site forgot the quotes.
 pub(crate) fn js_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
+    let mut out = String::with_capacity(s.len() + 16);
+    out.push('"');
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -24,6 +28,7 @@ pub(crate) fn js_string(s: &str) -> String {
             _ => out.push(c),
         }
     }
+    out.push('"');
     out
 }
 
@@ -77,7 +82,7 @@ pub(crate) fn create_splash_window(app: &App) -> Result<(), Box<dyn std::error::
 pub(crate) fn splash_status(app: &tauri::AppHandle, key: &str, port: Option<u16>) {
     if let Some(splash) = app.get_webview_window("splash") {
         let port_js = match port {
-            Some(p) => format!("\"{p}\""),
+            Some(p) => js_string(&p.to_string()),
             None => "undefined".to_string(),
         };
         let _ = splash.eval(format!(
@@ -119,6 +124,16 @@ fn build_target_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn js_string_produces_a_quoted_literal() {
+        assert_eq!(js_string("plain"), "\"plain\"");
+        // Quotes, backslashes, and line terminators are escaped, so the
+        // spliced result stays a single valid JS literal — an unquoted
+        // splice site here turned every shell eval into a SyntaxError.
+        assert_eq!(js_string("a\"b\\c\nd\re"), "\"a\\\"b\\\\c\\nd\\re\"");
+        assert!(!js_string("a\nb").contains('\n'));
+    }
 
     #[test]
     fn splash_defines_every_status_key_the_shell_sends() {
