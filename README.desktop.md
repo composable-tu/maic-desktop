@@ -1,5 +1,7 @@
 # MAIC Desktop
 
+English | [简体中文](README.desktop.zh-CN.md)
+
 Tauri desktop wrapper for [OpenMAIC](https://github.com/THU-MAIC/OpenMAIC), consumed as a
 read-only git submodule in `openmaic-src/`. **Nothing inside `openmaic-src/` is ever modified
 by this wrapper** — all desktop code lives in `src-tauri/`, `scripts/`, and `.github/`.
