@@ -58,8 +58,8 @@ fn port_is_free(port: u16) -> bool {
 /// 3. a fresh random port.
 ///
 /// Note step 1 migrates old installs to the preferred port on next launch;
-/// web storage tied to the previous origin is orphaned once (same as today
-/// when the sticky port is taken).
+/// web storage tied to the previous origin is orphaned once — the same
+/// orphaning that already happens when the sticky port is taken.
 fn select_port(sticky: Option<u16>, preferred_free: bool, sticky_free: bool) -> Option<u16> {
     if preferred_free {
         return Some(PREFERRED_PORT);
@@ -284,11 +284,9 @@ fn verify_server_tree(server_dir: &std::path::Path) -> Result<(), String> {
             next_dir.display()
         ));
     }
-    // Deliberately no fallback here: an earlier version also accepted a
-    // `@swc/helpers` reached through pnpm's `.pnpm/node_modules` hoist bridge,
-    // which let a tree where `next` itself could not resolve its helpers pass
-    // verification — precisely the broken bundle that shipped as the Windows
-    // MODULE_NOT_FOUND crash.
+    // Deliberately no fallback here: a `@swc/helpers` reachable only through
+    // pnpm's `.pnpm/node_modules` hoist bridge means `next` itself cannot
+    // resolve its helpers — exactly the tree Node dies on. It must fail.
     let mut helpers_dir = None;
     let mut cur = Some(next_dir.as_path());
     while let Some(dir) = cur {
@@ -418,7 +416,7 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
             // fs::copy preserves the com.apple.provenance marker, and the
             // staged copy gets SIGKILLed on exec. A copy round-trip sheds the
             // enforcement (same trick as prepare-server's staging). The binary
-            // is already ad-hoc signed at stage time; the round-trip keeps it.
+            // keeps its official Node.js signature; the round-trip preserves it.
             let tmp = bin_dir.join(format!("openmaic-node{ext}.stage"));
             std::fs::copy(&staged, &tmp)
                 .map_err(|e| format!("failed to wash staged sidecar: {e}"))?;
@@ -777,8 +775,7 @@ fn boot_in_background(app: &tauri::AppHandle) {
     };
     // Windows MUST be created on the main thread: building the main window
     // here (worker thread) silently fails, leaving no windows at all — the
-    // runtime then exits and takes the healthy server down with it. That is
-    // exactly the "splash then nothing" symptom.
+    // runtime then exits and takes the healthy server down with it.
     let handle = app.clone();
     if let Err(e) = app.run_on_main_thread(move || {
         if let Some(splash) = handle.get_webview_window("splash") {
@@ -887,22 +884,18 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Show a splash window immediately: first launch extracts ~200 MB
-            // before the server can answer, which used to look like a dead
-            // launch (no window for a minute or more).
-            // Heavy work runs on a worker thread; the splash navigates to the
-            // server once /api/health is green, or shows the fatal error.
+            // before the server can answer, and that period needs a visible
+            // UI. Heavy work runs on a worker thread; the splash is closed
+            // and the main window opened once /api/health is green, or the
+            // splash shows the fatal error.
             //
-            // The page is compiled in and injected as an initialization
-            // script: it runs synchronously at document creation, so there is
-            // no eval-timing race (eval right after build may be dropped while
-            // about:blank isn't ready, which produced the blank window).
-            // WebviewUrl::App is avoided: in `tauri dev` it resolves to the
-            // dev server (404) and asset-protocol quirks differ per OS.
-            // Release: load the compiled-in page through the asset protocol
-            // (reliable, no timing race). Dev: WebviewUrl::App would resolve
-            // to the Next dev server (404), so use about:blank plus an
-            // initialization script that document.writes the same page.
-            // Both paths render identical content.
+            // The page is compiled in and reaches the document two ways that
+            // render identical content: release loads it through the asset
+            // protocol; dev uses about:blank plus an initialization script
+            // that document.writes the page (WebviewUrl::App would resolve to
+            // the Next dev server in `tauri dev`, a 404). The initialization
+            // script runs synchronously at document creation, so no separate
+            // eval is needed and it cannot race the page load.
             const SPLASH_HTML: &str = include_str!("../frontend-dist/splash.html");
             // initialization_script takes plain JS: document.write the page.
             // Escape for a JS string literal.
@@ -948,11 +941,10 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
-                // Splash closes during the splash -> main handoff while the
-                // server must stay alive for the main window. Only tear the
-                // server down when main itself is destroyed (RunEvent::Exit
-                // below is the final backup). Without this guard, closing
-                // the splash kills the healthy server and main opens blank.
+                // Only "main" owns the server lifetime (see owns_server):
+                // splash closes during the splash -> main handoff, while the
+                // server must stay alive for main. RunEvent::Exit below is
+                // the final backup.
                 if !owns_server(window.label()) {
                     return;
                 }

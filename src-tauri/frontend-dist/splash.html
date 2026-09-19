@@ -82,8 +82,8 @@
         margin-top: 4px;
         width: clamp(140px, 37.3vw, 190px);
       }
-      /* Status lines used to hard-cut; a short rise-in makes the swap read as
-         progress rather than a flicker. */
+      /* A short rise-in makes each status swap read as progress rather than
+         a hard flicker. */
       @keyframes statusIn { from { opacity: 0; transform: translateY(4px); } }
       #status.in { animation: statusIn 180ms ease-out; }
       #error {

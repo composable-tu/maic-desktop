@@ -76,7 +76,7 @@ async function pathExists(p) {
 }
 
 // Standalone staging copy. `dereference:false` so a link is never silently
-// expanded into a partial real dir (fatal under pnpm's isolated layout); any
+// expanded into a partial real dir that no later check can detect; any
 // link that survives is materialized by materializeLinks() below, so the
 // shipped tree is link-free and identical on every host.
 async function copyDir(src, dest) {
@@ -269,10 +269,10 @@ async function stageNodeBinary(triple, version) {
 
 // Boot the packed server from a clean extraction, the way the desktop shell
 // does on first launch: unpack the tarball, run `node server.js`, wait for
-// /api/health. This is the only check that catches a broken bundle before it
-// ships — static "can the file be stat'd" probes passed on Windows right up to
-// Node's own module walk failing, because Next resolves through the physical
-// layout, not the lexical one.
+// /api/health. This is the check that catches a broken bundle before it
+// ships: static file probes pass on trees whose physical layout still breaks
+// Node's module walk, because Next resolves through the physical layout, not
+// the lexical one.
 async function smokeTestBundledTarball(tarballPath, nodeBin, label) {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'maic-server-smoke-'));
   const serverDir = path.join(tmp, 'server');
@@ -463,17 +463,15 @@ async function main() {
   await fs.writeFile(path.join(resourcesDir, '.build-meta.json'), JSON.stringify(meta, null, 2));
   console.log('build meta:', JSON.stringify(meta));
 
-  // Ship a tree with ZERO symlinks/junctions. Under pnpm's default isolated
-  // layout that was impossible (Node only finds `next`'s deps inside the
-  // .pnpm store dir, so the links had to survive the trip through the
-  // installer — and Windows cannot carry them: bsdtar mangles symlink entries,
-  // and junctions restored at launch proved unreliable). Installing the
-  // submodule with a hoisted (npm-style) node-linker instead puts every
-  // package in a real directory reachable from its ancestors, so links are
-  // materialized here rather than transported. Host link semantics (macOS
-  // symlinks vs Windows junctions vs each installer's quirks) no longer affect
-  // the bundle, and long-path pressure on Windows drops away with the
-  // `.pnpm/<name>@<ver>_<peer-hash>` store segments.
+  // Ship a tree with ZERO symlinks/junctions. Windows cannot carry links
+  // through an installer (bsdtar mangles symlink entries), and restoring
+  // links at launch is unreliable, so the links must not exist in the first
+  // place. The hoisted (npm-style) node-linker puts every package in a real
+  // directory reachable from its ancestors, so links are materialized here
+  // rather than transported: host link semantics (macOS symlinks vs Windows
+  // junctions vs each installer's quirks) cannot affect the bundle, and the
+  // long `.pnpm/<name>@<ver>_<peer-hash>` store segments that push Windows
+  // toward the 260-character limit disappear.
   await materializeLinks(resourcesDir);
   await assertNoLinks(resourcesDir);
 
@@ -489,9 +487,7 @@ async function main() {
   );
 
   // Build-time gate: unpack the tarball somewhere clean and boot the real
-  // server from it, exactly as the desktop shell will on first launch. This is
-  // the only check that reproduces Windows' failure mode — static probes passed
-  // there while Node's own module walk did not.
+  // server from it, exactly as the desktop shell will on first launch.
   await smokeTestBundledTarball(tarballPath, nodeBin, smokeLabel);
   console.log('prepare-server done.');
   console.log(`NOTE: src-tauri/resources/server/ stays on disk for 'tauri dev'; release bundles ship ${path.basename(tarballPath)}.`);
