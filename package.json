@@ -3,14 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "description": "Tauri desktop wrapper for OpenMAIC (source lives in the openmaic-src submodule, never modified here).",
+  "type": "module",
   "packageManager": "pnpm@10.28.0",
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
-    "prepare:server": "node scripts/prepare-server.mjs",
+    "build:script": "tsdown",
+    "typecheck": "tsc -p scripts",
+    "prepare:server": "pnpm build:script && node scripts/dist/prepare-server.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2",
+    "@types/node": "^22",
+    "tsdown": "^0.23.0",
+    "typescript": "^5"
   }
 }

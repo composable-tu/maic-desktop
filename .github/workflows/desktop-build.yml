@@ -70,10 +70,10 @@ jobs:
       - name: Install wrapper deps
         run: pnpm install --frozen-lockfile
 
-      # Tauri's beforeBuildCommand runs `node scripts/prepare-server.mjs`,
-      # which builds the submodule, stages the server tarball and downloads
-      # the matching Node sidecar for the runner's native target — no extra
-      # step needed here.
+      # Tauri's beforeBuildCommand runs `pnpm prepare:server`, which bundles
+      # the TS build script, builds the submodule, stages the server tarball
+      # and downloads the matching Node sidecar for the runner's native
+      # target — no extra step needed here.
       - name: Tauri build
         run: pnpm tauri build
 

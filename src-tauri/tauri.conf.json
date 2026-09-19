@@ -6,7 +6,7 @@
   "build": {
     "devUrl": "http://localhost:3000",
     "beforeDevCommand": "pnpm --dir openmaic-src dev",
-    "beforeBuildCommand": "node scripts/prepare-server.mjs",
+    "beforeBuildCommand": "pnpm prepare:server",
     "frontendDist": "../src-tauri/frontend-dist"
   },
   "app": {

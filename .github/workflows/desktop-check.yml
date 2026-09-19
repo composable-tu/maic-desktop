@@ -41,10 +41,13 @@ jobs:
       - name: Install wrapper deps
         run: pnpm install --frozen-lockfile
 
+      - name: Typecheck wrapper scripts
+        run: pnpm typecheck
+
       # Full prepare (incl. Node sidecar download): tauri-build validates
       # that every externalBin file exists, even for --no-bundle smoke builds.
       - name: Prepare server (build submodule + stage sidecar)
-        run: node scripts/prepare-server.mjs --target x86_64-unknown-linux-gnu
+        run: pnpm build:script && node scripts/dist/prepare-server.mjs --target x86_64-unknown-linux-gnu
 
       - name: Rust check
         run: cargo check --manifest-path src-tauri/Cargo.toml

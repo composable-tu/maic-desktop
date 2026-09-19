@@ -35,10 +35,15 @@ be statically exported. Instead the desktop app ships the Next.js **standalone s
 | Command                          | What it does                                              |
 | -------------------------------- | --------------------------------------------------------- |
 | `pnpm dev`                       | Submodule `next dev` + Tauri window (port 3000)           |
-| `node scripts/prepare-server.mjs`| Build submodule, stage standalone server + Node sidecar   |
+| `pnpm prepare:server`            | Bundle build script (tsdown), build submodule, stage server + Node sidecar |
+| `pnpm typecheck`                 | Typecheck the build script (`scripts/src`, strict TS)     |
 | `pnpm build` / `pnpm tauri build`| `prepare-server` (via `beforeBuildCommand`) + Tauri bundle |
 
-`prepare-server.mjs` options:
+The build script lives in `scripts/src/` (strict TypeScript) and is bundled by
+tsdown to the gitignored `scripts/dist/prepare-server.mjs` — the commands above
+are the only entry points.
+
+`prepare-server` options:
 
 - `--target <rust-triple>`: which Node binary to download (default: host).
   Supported: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
@@ -97,8 +102,8 @@ never re-signs it — see the note in that script).
 
 ## CI
  
-- `desktop-check.yml` (PR / push to main touching wrapper files): submodule build +
-  `cargo check` + `tauri build --no-bundle` smoke on Ubuntu.
+- `desktop-check.yml` (PR / push to main touching wrapper files): wrapper script
+  typecheck + submodule build + `cargo check` + `tauri build --no-bundle` smoke on Ubuntu.
 - `desktop-build.yml` (`[build]`-prefixed pushes to main, manual dispatch):
   full bundles on 4 runners — mac-arm64, mac-x64, win-x64, win-arm64. Every
   job is gated on `prepare-server`'s smoke boot, which extracts the finished

@@ -45,3 +45,4 @@ src-tauri/resources/server/
 src-tauri/resources/server.tar.gz
 src-tauri/gen/
 dist/
+scripts/dist/
