@@ -52,14 +52,7 @@ fn port_is_free(port: u16) -> bool {
     TcpListener::bind(format!("127.0.0.1:{port}")).is_ok()
 }
 
-/// Port choice order. Pure logic, unit-tested:
-/// 1. PREFERRED_PORT when free (one stable origin across machines/installs),
-/// 2. the recorded sticky port when still free,
-/// 3. a fresh random port.
-///
-/// Note step 1 migrates old installs to the preferred port on next launch;
-/// web storage tied to the previous origin is orphaned once — the same
-/// orphaning that already happens when the sticky port is taken.
+/// Pure decision logic behind `pick_sticky_port`, split out for unit tests.
 fn select_port(sticky: Option<u16>, preferred_free: bool, sticky_free: bool) -> Option<u16> {
     if preferred_free {
         return Some(PREFERRED_PORT);
@@ -74,8 +67,10 @@ fn select_port(sticky: Option<u16>, preferred_free: bool, sticky_free: bool) -> 
 
 /// Sticky port selection. Web storage (IndexedDB, localStorage, Cache API) is
 /// scoped to the origin, so a random port every launch would orphan all cached
-/// data. Prefer PREFERRED_PORT when free; reuse the port recorded in the app
-/// data dir when it is still free; otherwise allocate a fresh one and record it.
+/// data: prefer PREFERRED_PORT when free — which migrates old installs and
+/// orphans their previous-origin storage once, the same orphaning that already
+/// happens when the sticky port is taken — reuse the recorded sticky port
+/// while it is free, otherwise allocate and record a fresh one.
 fn pick_sticky_port(app: &tauri::AppHandle) -> Result<u16, String> {
     let data_dir = app
         .path()
@@ -112,21 +107,9 @@ fn pick_sticky_port(app: &tauri::AppHandle) -> Result<u16, String> {
     Ok(port)
 }
 
-fn fatal(app: &tauri::AppHandle, message: &str) -> ! {
-    eprintln!("maic-desktop fatal: {message}");
-    // We run on the main thread during setup, so blocking is fine.
-    let _ = app
-        .dialog()
-        .message(message.to_string())
-        .title("MAIC Desktop")
-        .kind(MessageDialogKind::Error)
-        .blocking_show();
-    std::process::exit(1);
-}
-
 /// Locate the extracted server tree, extracting server.tar.gz on first launch
 /// (or when the bundled build differs from what's on disk).
-fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn ensure_server(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, String> {
     // Dev builds run straight from the source tree, where prepare-server
     // leaves an unpacked server/ dir — use it directly if present.
     let dev_dir = app
@@ -163,14 +146,13 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .path()
         .app_data_dir()
         .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
-    let staged_meta = read_bundled_meta(&tarball).unwrap_or_else(|_| "{}".to_string());
     let marker = data_dir.join(".build-meta.json");
     let current = std::fs::read_to_string(&marker).unwrap_or_default();
     let server_dir = data_dir.join("server");
 
     if current != staged_meta || !server_dir.join("server.js").exists() {
         splash_status(app, STATUS_EXTRACTING, None);
-        stage_fresh_server(app, &tarball, &data_dir, &server_dir, &staged_meta)?;
+        stage_fresh_server(app, &tarball, &data_dir, &server_dir, staged_meta)?;
     } else {
         println!("maic-desktop: reusing extracted server runtime");
         splash_status(app, STATUS_REUSING, None);
@@ -181,7 +163,7 @@ fn ensure_server(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         if let Err(e) = verify_server_tree(&server_dir) {
             eprintln!("maic-desktop: staged server failed validation ({e}); re-extracting");
             splash_status(app, STATUS_EXTRACTING, None);
-            stage_fresh_server(app, &tarball, &data_dir, &server_dir, &staged_meta)?;
+            stage_fresh_server(app, &tarball, &data_dir, &server_dir, staged_meta)?;
         }
     }
     Ok(server_dir)
@@ -258,11 +240,9 @@ fn extract_tarball(tarball: &std::path::Path, dest: &std::path::Path) -> Result<
     Ok(())
 }
 
-/// Verify the server tree is bootable before spawning: `server.js` exists, the
-/// `next` package carries `dist/`, and `@swc/helpers` is reachable the way Node
-/// reaches it — by walking up from `next`'s own directory. Without this, a
-/// pruned extraction surfaces much later as a bare
-/// `Cannot find module '@swc/helpers/_/...'` with no hint what is missing.
+/// Verify the staged tree can boot: `@swc/helpers` must be reachable the way
+/// Node reaches it — by walking up from `next`'s own directory — or the
+/// failure surfaces much later as a bare `MODULE_NOT_FOUND` with no hint.
 fn verify_server_tree(server_dir: &std::path::Path) -> Result<(), String> {
     let server_js = server_dir.join("server.js");
     if !server_js.is_file() {
@@ -342,6 +322,18 @@ fn read_bundled_meta(tarball: &std::path::Path) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|e| format!("bad build meta encoding: {e}"))
 }
 
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(path)
+        .map_err(|e| format!("failed to stat staged sidecar: {e}"))?
+        .permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(path, perm)
+        .map_err(|e| format!("failed to chmod staged sidecar: {e}"))?;
+    Ok(())
+}
+
 /// Copy the bundled Node sidecar out of the app bundle into the app data dir.
 ///
 /// Why: on macOS, any executable living inside `.app/Contents/MacOS/` is
@@ -402,15 +394,7 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
         std::fs::create_dir_all(&bin_dir).map_err(|e| format!("failed to create bin dir: {e}"))?;
         std::fs::copy(&bundled, &staged).map_err(|e| format!("failed to stage sidecar: {e}"))?;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(&staged)
-                .map_err(|e| format!("failed to stat staged sidecar: {e}"))?
-                .permissions();
-            perm.set_mode(0o755);
-            std::fs::set_permissions(&staged, perm)
-                .map_err(|e| format!("failed to chmod staged sidecar: {e}"))?;
-        }
+        make_executable(&staged)?;
         #[cfg(target_os = "macos")]
         {
             // fs::copy preserves the com.apple.provenance marker, and the
@@ -422,16 +406,7 @@ fn ensure_sidecar(app: &tauri::AppHandle, staged_meta: &str) -> Result<PathBuf, 
                 .map_err(|e| format!("failed to wash staged sidecar: {e}"))?;
             std::fs::rename(&tmp, &staged)
                 .map_err(|e| format!("failed to wash staged sidecar: {e}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perm = std::fs::metadata(&staged)
-                    .map_err(|e| format!("failed to stat staged sidecar: {e}"))?
-                    .permissions();
-                perm.set_mode(0o755);
-                std::fs::set_permissions(&staged, perm)
-                    .map_err(|e| format!("failed to chmod staged sidecar: {e}"))?;
-            }
+            make_executable(&staged)?;
         }
         std::fs::write(&marker, staged_meta)
             .map_err(|e| format!("failed to write sidecar marker: {e}"))?;
@@ -485,8 +460,7 @@ fn wait_for_health(port: u16, child: &mut Child) -> HealthOutcome {
     while Instant::now() < deadline {
         if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
             ever_listened = true;
-            let url = format!("http://127.0.0.1:{port}/api/health");
-            if let Ok(true) = http_get_ok(&url) {
+            if health_ok(port) {
                 return HealthOutcome::Healthy;
             }
         }
@@ -510,23 +484,32 @@ fn wait_for_health(port: u16, child: &mut Child) -> HealthOutcome {
     }
 }
 
-/// Minimal blocking HTTP GET returning true on 2xx. No extra crates.
-fn http_get_ok(url: &str) -> Result<bool, ()> {
+/// Blocking GET /api/health on the loopback server; true on HTTP 200.
+/// Hand-rolled (no extra crates); the timeouts keep a wedged server from
+/// stalling the boot loop.
+fn health_ok(port: u16) -> bool {
     use std::io::{Read, Write};
 
-    let (host, port, path) = parse_url(url).ok_or(())?;
-    let mut stream = std::net::TcpStream::connect(format!("{host}:{port}")).map_err(|_| ())?;
-    stream
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    if stream
         .set_read_timeout(Some(Duration::from_secs(3)))
-        .map_err(|_| ())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(3)))
-        .map_err(|_| ())?;
-    write!(
+        .is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .is_err()
+    {
+        return false;
+    }
+    if write!(
         stream,
-        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        "GET /api/health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     )
-    .map_err(|_| ())?;
+    .is_err()
+    {
+        return false;
+    }
     let mut buf = vec![0u8; 4096];
     let mut raw = Vec::new();
     loop {
@@ -536,22 +519,11 @@ fn http_get_ok(url: &str) -> Result<bool, ()> {
             Err(_) => break,
         }
     }
-    let head = String::from_utf8_lossy(&raw);
-    let status_line = head.lines().next().unwrap_or("");
-    Ok(status_line.contains(" 200 ") || status_line.contains(" 200"))
-}
-
-fn parse_url(url: &str) -> Option<(String, u16, String)> {
-    let rest = url.strip_prefix("http://")?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], rest[i..].to_string()),
-        None => (rest, "/".to_string()),
-    };
-    let (host, port) = match authority.rfind(':') {
-        Some(i) => (authority[..i].to_string(), authority[i + 1..].parse().ok()?),
-        None => (authority.to_string(), 80),
-    };
-    Some((host, port, path))
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        == Some("200")
 }
 
 /// Spawn the sidecar and block until /api/health is green.
@@ -566,6 +538,7 @@ fn start_server(
     app: &tauri::AppHandle,
     server_dir: &std::path::Path,
     node_bin: &std::path::Path,
+    staged_meta: &str,
 ) -> Result<(String, Child), String> {
     let server_js = server_dir.join("server.js");
     if !server_js.exists() {
@@ -682,15 +655,13 @@ fn start_server(
                                     .path()
                                     .app_data_dir()
                                     .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
-                                let staged_meta = read_bundled_meta(&tarball)
-                                    .unwrap_or_else(|_| "{}".to_string());
                                 splash_status(app, STATUS_EXTRACTING, None);
                                 stage_fresh_server(
                                     app,
                                     &tarball,
                                     &data_dir,
                                     server_dir,
-                                    &staged_meta,
+                                    staged_meta,
                                 )?;
                                 break;
                             }
@@ -742,42 +713,46 @@ fn format_log_tail(tail: &str) -> String {
 /// App state holding the server child so it can be killed on exit.
 struct ServerChild(Mutex<Option<Child>>);
 
+impl ServerChild {
+    fn stop(&self) {
+        if let Ok(mut guard) = self.0.lock() {
+            if let Some(mut child) = guard.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
 /// Heavy boot work off the main thread: extract, stage, serve, then swap
 /// the splash window for the real one. Runs on a worker thread; UI updates
 /// go through the AppHandle (send-safe).
 fn boot_in_background(app: &tauri::AppHandle) {
+    if let Err(message) = boot(app) {
+        boot_failed(app, &message);
+    }
+}
+
+fn boot(app: &tauri::AppHandle) -> Result<(), String> {
     // Bundled build marker (also used to version the staged sidecar copy).
-    let tarball = app
+    let staged_meta = app
         .path()
         .resolve("resources/server.tar.gz", BaseDirectory::Resource)
         .map(|t| read_bundled_meta(&t).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_else(|_| "{}".to_string());
     splash_status(app, STATUS_CHECKING, None);
-    let server_dir = match ensure_server(app) {
-        Ok(dir) => dir,
-        Err(msg) => return boot_failed(app, &msg),
-    };
-    let node_bin = match ensure_sidecar(app, &tarball) {
-        Ok(bin) => bin,
-        Err(msg) => return boot_failed(app, &msg),
-    };
-    let (url, child) = match start_server(app, &server_dir, &node_bin) {
-        Ok(pair) => {
-            println!("maic-desktop: serving {}", pair.0);
-            pair
-        }
-        Err(msg) => return boot_failed(app, &msg),
-    };
+    let server_dir = ensure_server(app, &staged_meta)?;
+    let node_bin = ensure_sidecar(app, &staged_meta)?;
+    let (url, child) = start_server(app, &server_dir, &node_bin, &staged_meta)?;
+    println!("maic-desktop: serving {url}");
     app.manage(ServerChild(Mutex::new(Some(child))));
-    let parsed: tauri::Url = match url.parse().map_err(|e| format!("invalid server url: {e}")) {
-        Ok(u) => u,
-        Err(msg) => return boot_failed(app, &msg),
-    };
+    let parsed: tauri::Url = url
+        .parse()
+        .map_err(|e| format!("invalid server url: {e}"))?;
     // Windows MUST be created on the main thread: building the main window
     // here (worker thread) silently fails, leaving no windows at all — the
     // runtime then exits and takes the healthy server down with it.
     let handle = app.clone();
-    if let Err(e) = app.run_on_main_thread(move || {
+    app.run_on_main_thread(move || {
         if let Some(splash) = handle.get_webview_window("splash") {
             let _ = splash.close();
         }
@@ -788,9 +763,9 @@ fn boot_in_background(app: &tauri::AppHandle) {
         {
             boot_failed(&handle, &format!("failed to create main window: {e}"));
         }
-    }) {
-        boot_failed(app, &format!("failed to schedule main window: {e}"));
-    }
+    })
+    .map_err(|e| format!("failed to schedule main window: {e}"))?;
+    Ok(())
 }
 
 /// Boot stages the splash names. The wording lives in `STRINGS` inside
@@ -803,20 +778,37 @@ const STATUS_VERIFYING: &str = "verifying";
 const STATUS_STAGING: &str = "staging";
 const STATUS_PROBING: &str = "probing";
 
+/// Escape a string for embedding inside a JS string literal: raw quotes,
+/// backslashes, or line terminators would break the literal.
+fn js_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Push a boot stage to the splash window (best effort). Evals can be dropped
 /// while the page is still loading, so the build-target footer rides along with
 /// every push: whichever one first reaches the document paints the whole page.
 fn splash_status(app: &tauri::AppHandle, key: &str, port: Option<u16>) {
     if let Some(splash) = app.get_webview_window("splash") {
-        let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
         let port_js = match port {
             Some(p) => format!("\"{p}\""),
             None => "undefined".to_string(),
         };
         let _ = splash.eval(format!(
-            "window.__maicStatus && window.__maicStatus(\"{escaped}\",{port_js});\
-             window.__maicTarget && window.__maicTarget({:?})",
-            build_target_label()
+            "window.__maicStatus && window.__maicStatus({},{});\
+             window.__maicTarget && window.__maicTarget({})",
+            js_string(key),
+            port_js,
+            js_string(&build_target_label())
         ));
     }
 }
@@ -847,29 +839,30 @@ fn build_target_label() -> String {
     target_label(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Show the fatal error inside the splash window instead of exiting blindly.
-/// The message includes the captured server log tail when available.
+/// Show the fatal error inside the splash window when one exists — the
+/// message (including the captured server log tail) outlives the dialog —
+/// and always show the dialog. Without a splash nothing carries the error,
+/// so exit once the dialog closes.
 fn boot_failed(app: &tauri::AppHandle, message: &str) {
     eprintln!("maic-desktop fatal: {message}");
-    if let Some(splash) = app.get_webview_window("splash") {
-        // Order matters: show the message first, then the dialog — the user
-        // lands on a window that explains the failure either way.
-        let escaped = message
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n");
+    let splash = app.get_webview_window("splash");
+    if let Some(splash) = &splash {
+        // Order matters: paint the message first, then the dialog — the
+        // user lands on a window that explains the failure either way.
         let _ = splash.eval(format!(
-            "window.__maicFatal && window.__maicFatal(\"{escaped}\")"
+            "window.__maicFatal && window.__maicFatal({})",
+            js_string(message)
         ));
-        let _ = app
-            .dialog()
-            .message(message.to_string())
-            .title("MAIC Desktop")
-            .kind(MessageDialogKind::Error)
-            .blocking_show();
-        return;
     }
-    fatal(app, message);
+    let _ = app
+        .dialog()
+        .message(message.to_string())
+        .title("MAIC Desktop")
+        .kind(MessageDialogKind::Error)
+        .blocking_show();
+    if splash.is_none() {
+        std::process::exit(1);
+    }
 }
 
 /// Whether destroying the window with this label should tear down the server.
@@ -897,20 +890,10 @@ fn main() {
             // script runs synchronously at document creation, so no separate
             // eval is needed and it cannot race the page load.
             const SPLASH_HTML: &str = include_str!("../frontend-dist/splash.html");
-            // initialization_script takes plain JS: document.write the page.
-            // Escape for a JS string literal.
-            let mut init_js = String::with_capacity(SPLASH_HTML.len() + 64);
-            init_js.push_str("document.open();document.write(\"");
-            for c in SPLASH_HTML.chars() {
-                match c {
-                    '"' => init_js.push_str("\\\""),
-                    '\\' => init_js.push_str("\\\\"),
-                    '\n' => init_js.push_str("\\n"),
-                    '\r' => {}
-                    _ => init_js.push(c),
-                }
-            }
-            init_js.push_str("\");document.close();");
+            let init_js = format!(
+                "document.open();document.write({});document.close();",
+                js_string(SPLASH_HTML)
+            );
             #[cfg(not(debug_assertions))]
             let splash_url = WebviewUrl::App("splash.html".into());
             #[cfg(debug_assertions)]
@@ -949,11 +932,7 @@ fn main() {
                     return;
                 }
                 if let Some(state) = window.app_handle().try_state::<ServerChild>() {
-                    if let Ok(mut guard) = state.0.lock() {
-                        if let Some(mut child) = guard.take() {
-                            let _ = child.kill();
-                        }
-                    }
+                    state.stop();
                 }
             }
         })
@@ -962,11 +941,7 @@ fn main() {
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<ServerChild>() {
-                    if let Ok(mut guard) = state.0.lock() {
-                        if let Some(mut child) = guard.take() {
-                            let _ = child.kill();
-                        }
-                    }
+                    state.stop();
                 }
             }
         });

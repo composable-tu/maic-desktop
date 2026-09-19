@@ -74,9 +74,6 @@ jobs:
       # which builds the submodule, stages the server tarball and downloads
       # the matching Node sidecar for the runner's native target — no extra
       # step needed here.
-      - name: Show build provenance
-        run: echo "(populated by beforeBuildCommand during tauri build)"
-
       - name: Tauri build
         run: pnpm tauri build
 

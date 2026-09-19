@@ -20,6 +20,8 @@ import { createServer } from 'node:http';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -194,27 +196,10 @@ async function resolveNode22Latest() {
   return hit.version; // e.g. "v22.14.0"
 }
 
-function download(url, dest) {
-  return new Promise((resolve, reject) => {
-    const proto = url.startsWith('https:') ? import('node:https') : import('node:http');
-    proto.then(({ default: http }) => {
-      const req = http.get(url, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          download(res.headers.location, dest).then(resolve, reject);
-          return;
-        }
-        if (res.statusCode !== 200) {
-          reject(new Error(`download failed ${res.statusCode}: ${url}`));
-          return;
-        }
-        const out = createWriteStream(dest);
-        res.pipe(out);
-        out.on('finish', () => out.close(resolve));
-        out.on('error', reject);
-      });
-      req.on('error', reject);
-    }, reject);
-  });
+async function download(url, dest) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`download failed ${res.status}: ${url}`);
+  await pipeline(Readable.fromWeb(res.body), createWriteStream(dest));
 }
 
 async function stageNodeBinary(triple, version) {
