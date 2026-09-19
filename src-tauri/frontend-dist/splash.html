@@ -99,12 +99,17 @@
       #error.show { display: block; }
       .footer {
         position: absolute; left: 0; right: 0; bottom: 6px;
-        /* Same side gutter as the error panel, so both corners line up. */
-        display: flex; justify-content: space-between; gap: 16px;
-        padding: 0 clamp(24px, 8vw, 24px);
+        /* Same side gutter as the error panel, so the left edges line up. */
+        padding: 0 clamp(8px, 8vw, 8px);
         font-size: 10px; line-height: 1; letter-spacing: 0.08em;
         color: rgba(255, 255, 255, 0.25);
       }
+      /* Bottom-left stack: server version, chip target, then the disclaimer. */
+      .brand-block {
+        display: flex; flex-direction: column; align-items: flex-start;
+        gap: 3px; min-width: 0;
+      }
+      #server-version:empty { display: none; }
     </style>
   </head>
   <body>
@@ -117,7 +122,9 @@
       </div>
     </div>
     <div id="error"></div>
-    <div class="footer"><span id="brand">Unofficial OpenMAIC Desktop</span><span id="target"></span></div>
+    <div class="footer">
+      <div class="brand-block"><span id="server-version"></span><span id="target"></span><span id="brand">Unofficial OpenMAIC Desktop</span></div>
+    </div>
     <script>
       // The shell sends these keys, not display text, so all wording lives here
       // next to the markup. An unknown key falls through as literal text rather
@@ -147,14 +154,15 @@
       function pickLang(declared) {
         return /^zh/i.test(declared || '') ? 'zh' : 'en';
       }
-      var LANG = pickLang(navigator.language);
-      var T = Object.assign({}, STRINGS.en, STRINGS[LANG]);
+
+      const LANG = pickLang(navigator.language);
+      const T = Object.assign({}, STRINGS.en, STRINGS[LANG]);
       document.documentElement.lang = LANG === 'zh' ? 'zh-Hans' : 'en';
       document.getElementById('brand').textContent = T.brand;
 
-      var statusEl = document.getElementById('status');
+      const statusEl = document.getElementById('status');
       window.__maicStatus = function (key, port) {
-        var msg = (T[key] || key).replace('{port}', port || '');
+        const msg = (T[key] || key).replace('{port}', port || '');
         if (statusEl.textContent === msg) return;
         statusEl.textContent = msg;
         statusEl.classList.remove('in');
@@ -166,6 +174,9 @@
       window.__maicStatus('checking');
       window.__maicTarget = function (text) {
         document.getElementById('target').textContent = text;
+      };
+      window.__maicVersion = function (text) {
+        document.getElementById('server-version').textContent = 'OpenMAIC Server v' + text;
       };
       window.__maicFatal = function (message) {
         document.body.classList.add('has-error');

@@ -120,7 +120,7 @@ never re-signs it — see the note in that script).
 - Wrapper version (`package.json`, `tauri.conf.json`, `Cargo.toml`) starts at `0.1.0`
   and is independent of the submodule's version (currently OpenMAIC `1.0.3`).
 - Traceability comes from `src-tauri/resources/server/.build-meta.json`
-  (submodule SHA + embedded Node version + target).
+  (OpenMAIC version + submodule SHA + embedded Node version + target).
 
 ## Deliberately out of scope (v1)
 

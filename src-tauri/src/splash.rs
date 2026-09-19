@@ -2,6 +2,8 @@
 //! `STRINGS` inside splash.html so it can follow the webview's locale; the
 //! shell only carries the key.
 
+use std::sync::OnceLock;
+
 use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub(crate) const STATUS_CHECKING: &str = "checking";
@@ -76,17 +78,37 @@ pub(crate) fn create_splash_window(app: &App) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// The bundled OpenMAIC server version, set once from the build marker
+/// before the first status push; `None` leaves the splash version line
+/// empty (old bundles, dev without a staged marker).
+static SERVER_VERSION: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn set_server_version(version: Option<String>) {
+    if let Some(v) = version {
+        let _ = SERVER_VERSION.set(v);
+    }
+}
+
 /// Push a boot stage to the splash window (best effort). Evals can be dropped
-/// while the page is still loading, so the build-target footer rides along with
-/// every push: whichever one first reaches the document paints the whole page.
+/// while the page is still loading, so the footer (server version and build
+/// target) rides along with every push: whichever one first reaches the
+/// document paints the whole page.
 pub(crate) fn splash_status(app: &tauri::AppHandle, key: &str, port: Option<u16>) {
     if let Some(splash) = app.get_webview_window("splash") {
         let port_js = match port {
             Some(p) => js_string(&p.to_string()),
             None => "undefined".to_string(),
         };
+        let version_js = match SERVER_VERSION.get() {
+            Some(v) => format!(
+                "window.__maicVersion && window.__maicVersion({});",
+                js_string(v)
+            ),
+            None => String::new(),
+        };
         let _ = splash.eval(format!(
-            "window.__maicStatus && window.__maicStatus({},{});\
+            "{version_js}\
+             window.__maicStatus && window.__maicStatus({},{});\
              window.__maicTarget && window.__maicTarget({})",
             js_string(key),
             port_js,

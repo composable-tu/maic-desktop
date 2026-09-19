@@ -118,8 +118,19 @@ async function main(): Promise<void> {
     // non-fatal: meta just records unknown
   }
 
+  let openmaicVersion: string | null = null;
+  try {
+    const pkg = JSON.parse(await fs.readFile(path.join(srcDir, 'package.json'), 'utf8')) as {
+      version?: unknown;
+    };
+    if (typeof pkg.version === 'string') openmaicVersion = pkg.version;
+  } catch {
+    // display-only provenance; an absent field just hides the splash line
+  }
+
   const meta = {
     target: triple,
+    openmaicVersion,
     node: nodeVersion,
     binary: binaryName,
     submoduleSha,

@@ -103,7 +103,8 @@ bundle id 下的前台应用 —— 而这个服务永远不开窗口，它的 D
 
 - 封装版本（`package.json`、`tauri.conf.json`、`Cargo.toml`）从 `0.1.0` 起，独立于子模块
   版本（当前为 OpenMAIC `1.0.3`）。
-- 溯源信息在 `src-tauri/resources/server/.build-meta.json`（子模块 SHA + 内嵌 Node 版本 + 目标三元组）。
+- 溯源信息在 `src-tauri/resources/server/.build-meta.json`（OpenMAIC 版本 + 子模块 SHA +
+  内嵌 Node 版本 + 目标三元组）。
 
 ## v1 明确不做
 

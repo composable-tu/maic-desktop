@@ -197,6 +197,18 @@ fn verify_server_tree(server_dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Extract the OpenMAIC server version from `.build-meta.json` content.
+/// `None` hides the splash version line (old bundles, dev without a staged
+/// marker).
+pub(crate) fn server_version_from_meta(meta: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(meta)
+        .ok()?
+        .get("openmaicVersion")?
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
 /// Read .build-meta.json out of the tarball without extracting it.
 pub(crate) fn read_bundled_meta(tarball: &std::path::Path) -> Result<String, String> {
     let mut cmd = Command::new("tar");
@@ -216,6 +228,18 @@ pub(crate) fn read_bundled_meta(tarball: &std::path::Path) -> Result<String, Str
 mod verify_tree_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn server_version_parses_from_meta() {
+        assert_eq!(
+            server_version_from_meta(r#"{"openmaicVersion":"1.0.3"}"#).as_deref(),
+            Some("1.0.3")
+        );
+        assert_eq!(server_version_from_meta("{}"), None);
+        assert_eq!(server_version_from_meta(r#"{"openmaicVersion":""}"#), None);
+        assert_eq!(server_version_from_meta(r#"{"openmaicVersion":42}"#), None);
+        assert_eq!(server_version_from_meta("not json"), None);
+    }
 
     #[test]
     fn verify_passes_on_complete_tree() {

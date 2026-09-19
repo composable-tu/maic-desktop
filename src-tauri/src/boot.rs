@@ -23,9 +23,14 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 use crate::health::{wait_for_health, HealthOutcome};
 use crate::port::{pick_free_port, pick_sticky_port};
-use crate::server_tree::{ensure_server, read_bundled_meta, stage_fresh_server};
+use crate::server_tree::{
+    ensure_server, read_bundled_meta, server_version_from_meta, stage_fresh_server,
+};
 use crate::sidecar::ensure_sidecar;
-use crate::splash::{js_string, splash_status, STATUS_CHECKING, STATUS_EXTRACTING, STATUS_PROBING};
+use crate::splash::{
+    js_string, set_server_version, splash_status, STATUS_CHECKING, STATUS_EXTRACTING,
+    STATUS_PROBING,
+};
 
 const MAX_PORT_ATTEMPTS: u32 = 5;
 
@@ -236,11 +241,23 @@ pub(crate) fn boot_in_background(app: &tauri::AppHandle) {
 
 fn boot(app: &tauri::AppHandle) -> Result<(), String> {
     // Bundled build marker (also used to version the staged sidecar copy).
-    let staged_meta = app
+    // Release reads it out of the tarball; dev has no tarball and reads the
+    // marker staged beside the unpacked server tree instead.
+    let staged_meta = match app
         .path()
         .resolve("resources/server.tar.gz", BaseDirectory::Resource)
-        .map(|t| read_bundled_meta(&t).unwrap_or_else(|_| "{}".to_string()))
-        .unwrap_or_else(|_| "{}".to_string());
+    {
+        Ok(tarball) if tarball.exists() => {
+            read_bundled_meta(&tarball).unwrap_or_else(|_| "{}".to_string())
+        }
+        _ => app
+            .path()
+            .resolve("resources/server/.build-meta.json", BaseDirectory::Resource)
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| "{}".to_string()),
+    };
+    set_server_version(server_version_from_meta(&staged_meta));
     splash_status(app, STATUS_CHECKING, None);
     let server_dir = ensure_server(app, &staged_meta)?;
     let node_bin = ensure_sidecar(app, &staged_meta)?;
