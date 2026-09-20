@@ -23,3 +23,9 @@ custom-protocol = ["tauri/custom-protocol"]
 # signature pulls OSVERSIONINFOW from Win32_System_SystemInformation.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_System_SystemInformation"] }
+
+# sysctlbyname("kern.osproductversion") is what `sw_vers` reads underneath;
+# fetched directly from libSystem, no process spawn. Already a transitive
+# dependency, so this costs nothing.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

@@ -2,7 +2,6 @@
 //! `STRINGS` inside splash.html so it can follow the webview's locale; the
 //! shell only carries the key.
 
-use std::process::Command;
 use std::sync::OnceLock;
 
 use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -169,16 +168,7 @@ fn os_version() -> Option<String> {
 
 fn compute_os_version() -> Option<String> {
     match std::env::consts::OS {
-        "macos" => {
-            let out = Command::new("sw_vers")
-                .arg("-productVersion")
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            sanitized_version(&String::from_utf8_lossy(&out.stdout))
-        }
+        "macos" => true_macos_version(),
         "windows" => {
             let (major, build) = true_windows_version()?;
             // The caller contract guarantees major == 10 (Windows 10/11);
@@ -188,6 +178,39 @@ fn compute_os_version() -> Option<String> {
         // Other dev targets have no shipped bundles; keep the plain label.
         _ => None,
     }
+}
+
+/// macOS version via `sysctlbyname("kern.osproductversion")` — the same
+/// value `sw_vers -productVersion` prints, read directly from libSystem
+/// without spawning a process.
+#[cfg(target_os = "macos")]
+fn true_macos_version() -> Option<String> {
+    use std::ffi::c_char;
+
+    const NAME: &[u8] = b"kern.osproductversion\0";
+    let mut buf = [0u8; 16];
+    let mut len = buf.len();
+    // SAFETY: `name` is NUL-terminated, and `buf`/`len` describe writable
+    // space far larger than any version string.
+    if unsafe {
+        libc::sysctlbyname(
+            NAME.as_ptr().cast::<c_char>(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(len);
+    sanitized_version(std::str::from_utf8(&buf[..end]).ok()?)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn true_macos_version() -> Option<String> {
+    None
 }
 
 /// True Windows version via `RtlGetVersion` — the one API that does not lie:
@@ -330,5 +353,14 @@ mod tests {
         assert_eq!(windows_marketing_version(22000), "11");
         assert_eq!(windows_marketing_version(19045), "10");
         assert_eq!(windows_marketing_version(10240), "10");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_version_is_discovered_live() {
+        // The sysctl read runs against the real host; the sanitized digits
+        // guarantee the label stays splice-safe.
+        let v = true_macos_version().expect("kern.osproductversion must resolve on macOS");
+        assert!(v.chars().all(|c| c.is_ascii_digit() || c == '.'));
     }
 }
