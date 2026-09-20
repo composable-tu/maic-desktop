@@ -2,6 +2,7 @@
 //! `STRINGS` inside splash.html so it can follow the webview's locale; the
 //! shell only carries the key.
 
+use std::process::Command;
 use std::sync::OnceLock;
 
 use tauri::{App, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -139,10 +140,104 @@ fn target_label(os: &str, arch: &str) -> String {
     format!("{os} ({arch})")
 }
 
-fn build_target_label() -> String {
-    target_label(std::env::consts::OS, std::env::consts::ARCH)
+/// Insert the runtime OS version after the OS name: the arch half stays the
+/// build target, the version says which OS release the app runs on.
+fn with_version(label: &str, version: Option<&str>) -> String {
+    match version {
+        Some(v) => match label.split_once(" (") {
+            // `arch` keeps the label's own closing paren.
+            Some((os, arch)) => format!("{os} {v} ({arch}"),
+            None => format!("{label} {v}"),
+        },
+        None => label.to_string(),
+    }
 }
 
+fn build_target_label() -> String {
+    with_version(
+        &target_label(std::env::consts::OS, std::env::consts::ARCH),
+        os_version().as_deref(),
+    )
+}
+
+/// Best-effort runtime OS version for the footer. Cached: the label is
+/// rebuilt on every status push.
+fn os_version() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE.get_or_init(compute_os_version).clone()
+}
+
+fn compute_os_version() -> Option<String> {
+    match std::env::consts::OS {
+        "macos" => {
+            let out = Command::new("sw_vers")
+                .arg("-productVersion")
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            sanitized_version(&String::from_utf8_lossy(&out.stdout))
+        }
+        "windows" => {
+            let (major, build) = true_windows_version()?;
+            // The caller contract guarantees major == 10 (Windows 10/11);
+            // anything older keeps the plain label.
+            (major == 10).then(|| windows_marketing_version(build).to_string())
+        }
+        // Other dev targets have no shipped bundles; keep the plain label.
+        _ => None,
+    }
+}
+
+/// True Windows version via `RtlGetVersion` — the one API that does not lie:
+/// `GetVersionExW` reports 6.2 from Windows 8.1 onward unless the manifest
+/// opts in, and `cmd /c ver` output is localized (zh-CN prints 版本). No
+/// process spawn.
+#[cfg(windows)]
+fn true_windows_version() -> Option<(u32, u32)> {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        dwMajorVersion: 0,
+        dwMinorVersion: 0,
+        dwBuildNumber: 0,
+        dwPlatformId: 0,
+        szCSDVersion: [0; 128],
+    };
+    // SAFETY: `info` is a valid, correctly sized OSVERSIONINFOW; the call
+    // only fills the struct.
+    if unsafe { RtlGetVersion(&mut info) } == 0 {
+        Some((info.dwMajorVersion, info.dwBuildNumber))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn true_windows_version() -> Option<(u32, u32)> {
+    None
+}
+
+/// Build 22000 is where Windows 11 starts; below it, Windows 10.
+fn windows_marketing_version(build: u32) -> &'static str {
+    if build >= 22000 {
+        "11"
+    } else {
+        "10"
+    }
+}
+
+/// Trust only digits and dots — this text is spliced into the footer label.
+fn sanitized_version(text: &str) -> Option<String> {
+    let v = text.trim();
+    (!v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.')).then(|| v.to_string())
+}
+
+/// Map `cmd /c ver` output ("Microsoft Windows [Version 10.0.26100.2314]") to
+/// the marketing version every Windows user recognises.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,10 +291,44 @@ mod tests {
         assert_eq!(target_label("linux", "arm"), "Linux (arm)");
         let live = build_target_label();
         assert!(
-            live.starts_with("macOS (")
-                || live.starts_with("Windows (")
-                || live.starts_with("Linux ("),
+            (live.starts_with("macOS") || live.starts_with("Windows") || live.starts_with("Linux"))
+                && live.contains(" ("),
             "unrecognised target family: {live}"
         );
+    }
+
+    #[test]
+    fn with_version_inserts_the_runtime_os_version() {
+        assert_eq!(
+            with_version("macOS (Apple Silicon)", Some("15.1")),
+            "macOS 15.1 (Apple Silicon)"
+        );
+        assert_eq!(
+            with_version("Windows (x86_64)", Some("11")),
+            "Windows 11 (x86_64)"
+        );
+        // No version available: the build-target label stands alone.
+        assert_eq!(
+            with_version("macOS (Apple Silicon)", None),
+            "macOS (Apple Silicon)"
+        );
+        assert_eq!(with_version("Linux (arm)", None), "Linux (arm)");
+    }
+
+    #[test]
+    fn os_version_inputs_are_sanitized() {
+        assert_eq!(sanitized_version("15.1\n"), Some("15.1".into()));
+        assert_eq!(sanitized_version("15.1.1"), Some("15.1.1".into()));
+        assert_eq!(sanitized_version(""), None);
+        assert_eq!(sanitized_version("rm -rf /"), None);
+        assert_eq!(sanitized_version("1;2"), None);
+    }
+
+    #[test]
+    fn windows_marketing_version_maps_the_build() {
+        assert_eq!(windows_marketing_version(26100), "11");
+        assert_eq!(windows_marketing_version(22000), "11");
+        assert_eq!(windows_marketing_version(19045), "10");
+        assert_eq!(windows_marketing_version(10240), "10");
     }
 }

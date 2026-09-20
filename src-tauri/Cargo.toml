@@ -17,3 +17,9 @@ tauri-plugin-dialog = "2"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+# RtlGetVersion (Wdk_System_SystemServices) is the only Windows API that
+# reports the true OS version; used for the splash footer label. Its
+# signature pulls OSVERSIONINFOW from Win32_System_SystemInformation.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_System_SystemInformation"] }
