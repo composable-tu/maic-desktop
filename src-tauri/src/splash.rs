@@ -254,6 +254,9 @@ fn windows_marketing_version(build: u32) -> &'static str {
 }
 
 /// Trust only digits and dots — this text is spliced into the footer label.
+/// `test` keeps the Linux CI job able to exercise the sanitizer even though
+/// only the macOS reader calls it.
+#[cfg(any(test, target_os = "macos"))]
 fn sanitized_version(text: &str) -> Option<String> {
     let v = text.trim();
     (!v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.')).then(|| v.to_string())
